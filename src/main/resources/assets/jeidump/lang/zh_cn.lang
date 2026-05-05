@@ -1,6 +1,6 @@
 jeidump.command.usage=/dumpjei [文件夹] [每刻配方数] - 将所有JEI配方和资源文件转储到<游戏目录>/jeidump/<文件夹>。
 jeidump.command.start=开始将JEI转储到%s……
-jeidump.command.progress=已转储%d / %d个配方（%s）。
+jeidump.command.progress=已转储：%d / %d 个配方（%s）。
 jeidump.command.done=JEI转储完成：%d个类别，%d个配方，%d个唯一图标。输出：%s
 jeidump.command.error=JEI转储失败：%s
 jeidump.command.no_runtime=JEI尚未就绪。请打开一次JEI界面后再次尝试。
