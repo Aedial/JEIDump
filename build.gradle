@@ -72,6 +72,58 @@ java {
     }
 }
 
+// Generate the locale manifest from the bundled lang files
+def bundledLangDir = file('src/main/resources/assets/jeidump/lang')
+def generatedLocaleManifestDir = layout.buildDirectory.dir('generated/resources/localeManifest/main')
+def generatedLocaleManifestFile = generatedLocaleManifestDir.map { it.file('assets/jeidump/lang/locales.txt') }
+
+sourceSets {
+    main {
+        resources {
+            srcDir generatedLocaleManifestDir
+        }
+    }
+}
+
+tasks.register('generateLocaleManifest') {
+    group = 'build'
+    description = 'Generates assets/jeidump/lang/locales.txt from bundled .lang files.'
+    inputs.files(fileTree(bundledLangDir) {
+        include '*.lang'
+    })
+    outputs.file(generatedLocaleManifestFile)
+
+    doLast {
+        File outputFile = generatedLocaleManifestFile.get().asFile
+        File outputDir = outputFile.parentFile
+        if (!outputDir.exists() && !outputDir.mkdirs()) {
+            throw new GradleException("Cannot create generated locale manifest directory [$outputDir]")
+        }
+
+        List<String> locales = fileTree(bundledLangDir) {
+            include '*.lang'
+        }.files.collect { file ->
+            file.name.substring(0, file.name.length() - '.lang'.length()).toLowerCase(Locale.ROOT).replace('-', '_')
+        }.findAll { !it.isEmpty() }.unique()
+
+        locales.sort { left, right ->
+            if (left == 'en_us') return -1
+            if (right == 'en_us') return 1
+            return left <=> right
+        }
+
+        String manifest = '# Generated from bundled .lang files.\n'
+        if (!locales.isEmpty()) {
+            manifest += locales.join('\n') + '\n'
+        }
+        outputFile.setText(manifest, 'UTF-8')
+    }
+}
+
+tasks.named('sourcesJar').configure {
+    dependsOn 'generateLocaleManifest'
+}
+
 configurations {
     embed
     create("runtimeOnlyNonPublishable") {
@@ -186,6 +238,8 @@ if (propertyBool('use_access_transformer')) {
 }
 
 processResources {
+
+    dependsOn 'generateLocaleManifest'
 
     inputs.property 'mod_id', propertyString('mod_id')
     inputs.property 'mod_name', propertyString('mod_name')
@@ -362,7 +416,7 @@ tasks.withType(JavaCompile).configureEach {
 
 tasks.register('cleanroomAfterSync') {
     group 'cleanroom helpers'
-    dependsOn 'injectTags', 'generateMixinJson'
+    dependsOn 'injectTags', 'generateLocaleManifest', 'generateMixinJson'
 }
 
 if (propertyBool('use_modern_java_syntax')) {

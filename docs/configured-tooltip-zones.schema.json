@@ -1,0 +1,88 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/Aedial/JEIDump/blob/main/docs/configured-tooltip-zones.schema.json",
+  "title": "JEI Dump Configured Tooltip Zones",
+  "description": "Schema for tooltip query zones loaded from config/jeidump/integrations/<modid>/**/*.json.",
+  "definitions": {
+    "zone": {
+      "type": "object",
+      "properties": {
+        "$schema": { "type": "string" },
+        "wrapperClass": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional wrapper class name. Matching uses Class.isInstance, so base wrapper classes also match subclasses."
+        },
+        "categoryUid": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional JEI category uid."
+        },
+        "x": {
+          "type": "integer",
+          "description": "Zone X coordinate in recipe-local JEI pixels."
+        },
+        "y": {
+          "type": "integer",
+          "description": "Zone Y coordinate in recipe-local JEI pixels."
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Zone width in recipe-local JEI pixels."
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Zone height in recipe-local JEI pixels."
+        },
+        "queryX": {
+          "type": "integer",
+          "description": "Optional X coordinate used to sample the mod's tooltip. Defaults to the zone center when omitted, and must stay inside the configured zone."
+        },
+        "queryY": {
+          "type": "integer",
+          "description": "Optional Y coordinate used to sample the mod's tooltip. Defaults to the zone center when omitted, and must stay inside the configured zone."
+        }
+      },
+      "required": ["x", "y", "width", "height"],
+      "anyOf": [
+        {
+          "required": ["wrapperClass"]
+        },
+        {
+          "required": ["categoryUid"]
+        }
+      ],
+      "dependencies": {
+        "queryX": ["queryY"],
+        "queryY": ["queryX"]
+      },
+      "additionalProperties": false
+    },
+    "singleZoneDocument": { "$ref": "#/definitions/zone" },
+    "zoneArrayDocument": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/definitions/zone" }
+    },
+    "zonesPropertyDocument": {
+      "type": "object",
+      "properties": {
+        "$schema": { "type": "string" },
+        "zones": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/definitions/zone" }
+        }
+      },
+      "required": ["zones"],
+      "additionalProperties": false
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/definitions/singleZoneDocument" },
+    { "$ref": "#/definitions/zoneArrayDocument" },
+    { "$ref": "#/definitions/zonesPropertyDocument" }
+  ]
+}

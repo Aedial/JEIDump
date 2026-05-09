@@ -12,7 +12,6 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.command.CommandBase;
 import net.minecraft.command.ICommandSender;
 import net.minecraft.server.MinecraftServer;
-import net.minecraft.util.text.TextComponentString;
 import net.minecraft.util.text.TextComponentTranslation;
 
 import net.minecraftforge.common.MinecraftForge;
@@ -20,27 +19,24 @@ import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 import net.minecraftforge.fml.common.gameevent.TickEvent;
 
 import mezz.jei.api.IJeiRuntime;
+import mezz.jei.api.ingredients.IIngredientRegistry;
 
 import com.jeidump.JeiDump;
+import com.jeidump.config.JeiDumpConfig;
 import com.jeidump.dump.Dumper;
 import com.jeidump.jei.JeiDumpPlugin;
 
 /**
  * Client-side {@code /dumpjei [folder] [recipesPerTick]} command.
- *
+ * <p>
  * The actual rendering MUST happen on the client thread (GL context), but doing the whole dump
  * inside one tick freezes the window long enough that the OS marks it Not Responding (and may
  * kill it on big modpacks). To avoid that, the command spawns a {@link Dumper} state machine and
  * registers a {@link TickEvent.ClientTickEvent} handler that processes a small fixed number of
  * recipes per tick. The Minecraft main loop continues to pump events between ticks, so the OS
  * keeps the window alive and the user can still ALT-TAB.
- *
- * Default budget: 5 recipes / client tick (= 100/sec at the standard 20 TPS). Increase with
- * {@code /dumpjei myfolder 20} to trade interactivity for speed.
  */
 public class CommandDumpJei extends CommandBase {
-
-    private static final int DEFAULT_RECIPES_PER_TICK = 5;
 
     /** Single in-flight job. We refuse to start a second one while this is non-null. */
     @Nullable
@@ -70,11 +66,13 @@ public class CommandDumpJei extends CommandBase {
     @Override
     public void execute(@Nullable MinecraftServer server, ICommandSender sender, String[] args) {
         if (active != null) {
-            info(sender, "[jeidump] A dump is already in progress (" + active.job.getResult().recipeCount + " recipes done so far).");
+            info(sender, "jeidump.command.in_progress", active.job.getResult().recipeCount);
             return;
         }
+
         IJeiRuntime runtime = JeiDumpPlugin.getRuntime();
-        if (runtime == null) {
+        IIngredientRegistry ingredientRegistry = JeiDumpPlugin.getIngredientRegistry();
+        if (runtime == null || ingredientRegistry == null) {
             sender.sendMessage(new TextComponentTranslation("jeidump.command.no_runtime"));
             return;
         }
@@ -82,21 +80,22 @@ public class CommandDumpJei extends CommandBase {
         // Resolve output folder: <gameDir>/jeidump/<folder>; default folder is a UTC timestamp.
         String folderName = args.length > 0 ? sanitize(args[0]) : new SimpleDateFormat("yyyyMMdd-HHmmss").format(new Date());
         // Optional second arg: budget per tick. Clamp to a sane range to avoid /dumpjei x 0 stalling forever.
-        int budget = DEFAULT_RECIPES_PER_TICK;
+        int budget = JeiDumpConfig.defaultRecipesPerTick;
         if (args.length > 1) {
             try {
-                budget = Math.max(1, Math.min(500, Integer.parseInt(args[1])));
+                budget = Math.max(1, Integer.parseInt(args[1]));
             } catch (NumberFormatException nfe) {
-                info(sender, "[jeidump] Invalid recipesPerTick \"" + args[1] + "\", using default " + DEFAULT_RECIPES_PER_TICK + ".");
+                info(sender, "jeidump.command.invalid_budget", args[1], JeiDumpConfig.defaultRecipesPerTick);
             }
         }
+
         File gameDir = Minecraft.getMinecraft().gameDir;
         File outDir = new File(new File(gameDir, "jeidump"), folderName);
 
         sender.sendMessage(new TextComponentTranslation("jeidump.command.start", outDir.getAbsolutePath()));
-        info(sender, "[jeidump] Budget: " + budget + " recipes/tick. Game may not be very responsive.");
+        info(sender, "jeidump.command.budget", budget);
 
-        Dumper job = new Dumper(runtime, outDir, sender);
+        Dumper job = Dumper.create(runtime, ingredientRegistry, outDir, sender);
         try {
             job.setup();
         } catch (Throwable t) {
@@ -117,14 +116,16 @@ public class CommandDumpJei extends CommandBase {
         public final Dumper job;
         private final ICommandSender chatSender;
         private final File outDir;
-        private final int budget;
+        private final int recipeBudget;
+        private final int backgroundSplitBudget;
         private boolean finished;
 
         DumpRunner(Dumper job, ICommandSender chatSender, File outDir, int budget) {
             this.job = job;
             this.chatSender = chatSender;
             this.outDir = outDir;
-            this.budget = budget;
+            this.recipeBudget = budget;
+            this.backgroundSplitBudget = Math.max(1, JeiDumpConfig.backgroundSplitImagesPerTick);
         }
 
         @SubscribeEvent
@@ -135,7 +136,7 @@ public class CommandDumpJei extends CommandBase {
 
             boolean more;
             try {
-                more = job.step(budget);
+                more = job.step(recipeBudget, backgroundSplitBudget);
             } catch (Throwable t) {
                 JeiDump.LOGGER.error("JEI dump step failed", t);
                 chatSender.sendMessage(new TextComponentTranslation("jeidump.command.error", String.valueOf(t.getMessage())));
@@ -181,8 +182,8 @@ public class CommandDumpJei extends CommandBase {
         sender.sendMessage(new TextComponentTranslation("jeidump.command.progress", done, total, label));
     }
 
-    /** Helper for plain-text status (no localization round-trip). */
-    public static void info(ICommandSender sender, String msg) {
-        sender.sendMessage(new TextComponentString(msg));
+    /** Helper for translated status lines that are not tied to a dedicated call site type. */
+    public static void info(ICommandSender sender, String key, Object... args) {
+        sender.sendMessage(new TextComponentTranslation(key, args));
     }
 }

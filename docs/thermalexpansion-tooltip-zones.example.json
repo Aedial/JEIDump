@@ -1,0 +1,19 @@
+{
+  "$schema": "./configured-tooltip-zones.schema.json",
+  "zones": [
+    {
+      "wrapperClass": "cofh.thermalexpansion.plugins.jei.machine.BaseRecipeWrapper",
+      "x": 34,
+      "y": 43,
+      "width": 16,
+      "height": 16
+    },
+    {
+      "categoryUid": "thermalexpansion.insolator",
+      "x": 79,
+      "y": 24,
+      "width": 24,
+      "height": 16
+    }
+  ]
+}

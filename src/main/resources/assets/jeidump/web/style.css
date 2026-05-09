@@ -59,6 +59,34 @@ code {
     margin: 0;
     letter-spacing: 0.02em;
 }
+.topbar-tools {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+.locale-wrap {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.locale-wrap label {
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+}
+.locale-wrap select {
+    min-width: 110px;
+    padding: 7px 10px;
+    border: 1px solid #1c587f;
+    border-radius: 4px;
+    background: #fff;
+    color: #222;
+    font-size: 14px;
+}
+.locale-wrap select:focus {
+    outline: 2px solid #f1c40f;
+    outline-offset: 1px;
+}
 .search-wrap {
     position: relative;
     width: 380px;
@@ -102,6 +130,12 @@ code {
 .search-results .row:hover, .search-results .row.active {
     background: var(--c-row-hover);
 }
+.search-results .row.muted {
+    cursor: default;
+}
+.search-results .row.muted:hover {
+    background: #fff;
+}
 .search-results .row img {
     width: 24px; height: 24px;
     image-rendering: pixelated;
@@ -111,6 +145,10 @@ code {
     font-size: 12px;
     color: var(--c-muted);
     margin-left: auto;
+}
+.search-placeholder {
+    width: 24px;
+    flex: 0 0 24px;
 }
 
 /* Layout: fixed sidebar + main content */
@@ -162,6 +200,12 @@ code {
     font-size: 11px;
     margin-left: 6px;
 }
+.sidebar .group-title {
+    margin-top: 8px;
+    color: #444;
+    font-size: 12px;
+    font-weight: 600;
+}
 .sidebar .count {
     color: var(--c-muted);
     font-size: 11px;
@@ -190,22 +234,18 @@ code {
 /* Recipe grid */
 .recipe-grid {
     display: grid;
-    /* Cards size to fit their image's natural display width (the dumper renders recipes at
-       a higher resolution, then app.js displays them at an integer multiple of the *logical*
-       canvas size). 240px is wide enough for the typical 128x64 vanilla recipe at 2x zoom
-       plus padding; oversized recipes spill into a wider track via auto-fill. */
-    grid-template-columns: repeat(auto-fill, minmax(240px, max-content));
     justify-content: start;
     gap: 14px;
 }
 .recipe-card {
+     box-sizing: border-box;
     padding: 8px;
     background: #fff;
     text-align: center;
     transition: box-shadow 0.12s ease;
-    /* Fit the displayed image; never stretch. The wrap below sets explicit pixel width/height
-       to lock the image at an integer multiple of its logical size. */
-    width: max-content;
+     /* app.js injects the measured outer width for the current grid so every card keeps the
+         same footprint as the recipe image it wraps. */
+     width: var(--recipe-card-width, max-content);
 }
 .recipe-card img {
     image-rendering: pixelated;
@@ -221,7 +261,8 @@ code {
 /*
  * Hotspot overlay over a recipe image. The wrap is sized in CSS pixels to match the displayed
  * image (logicalSize * DISPLAY_ZOOM, set inline by app.js); hotspots are positioned in % of that
- * wrap which equals % of the logical canvas, so the maths line up regardless of zoom.
+ * wrap which equals % of the logical canvas, so the maths line up regardless of zoom. Some
+ * categories also stack a shared background image below the per-recipe foreground layer.
  */
 .recipe-img-wrap {
     position: relative;
@@ -235,11 +276,21 @@ code {
     width: 100%;
     height: 100%;
 }
+.recipe-layer {
+    z-index: 1;
+}
+.recipe-layer-bg {
+    z-index: 0;
+}
+.recipe-layer-fg {
+    z-index: 1;
+}
 .hotspot {
     position: absolute;
     box-sizing: border-box;
     cursor: help;
     border-radius: 2px;
+    z-index: 2;
 }
 .hotspot:hover, .hotspot:focus {
     background: rgba(255, 255, 200, 0.35);
@@ -287,6 +338,28 @@ code {
     image-rendering: crisp-edges;
 }
 
+.mc-color-0 { color: #000000; }
+.mc-color-1 { color: #0000aa; }
+.mc-color-2 { color: #00aa00; }
+.mc-color-3 { color: #00aaaa; }
+.mc-color-4 { color: #aa0000; }
+.mc-color-5 { color: #aa00aa; }
+.mc-color-6 { color: #ffaa00; }
+.mc-color-7 { color: #aaaaaa; }
+.mc-color-8 { color: #555555; }
+.mc-color-9 { color: #5555ff; }
+.mc-color-a { color: #55ff55; }
+.mc-color-b { color: #55ffff; }
+.mc-color-c { color: #ff5555; }
+.mc-color-d { color: #ff55ff; }
+.mc-color-e { color: #ffff55; }
+.mc-color-f { color: #ffffff; }
+.mc-obfuscated { filter: blur(0.75px); }
+.mc-bold { font-weight: bold; }
+.mc-strikethrough { text-decoration: line-through; }
+.mc-underline { text-decoration: underline; }
+.mc-italic { font-style: italic; }
+
 /* Vanilla-flavoured tooltip popup; positioned in JS, follows the cursor. */
 .jei-tooltip {
     position: fixed;
@@ -305,6 +378,11 @@ code {
 .jei-tooltip .tt-name { color: #ffffff; font-weight: bold; }
 .jei-tooltip .tt-line { color: #aaaaaa; }
 .jei-tooltip .tt-mod { color: #5599ff; font-style: italic; margin-top: 2px; }
+.jei-tooltip .tt-name,
+.jei-tooltip .tt-line,
+.jei-tooltip .tt-mod {
+    white-space: pre-wrap;
+}
 
 /* Index / welcome */
 .index-grid {
@@ -366,9 +444,27 @@ code {
     font-size: 12px;
     text-align: center;
 }
+.footer-line + .footer-line {
+    margin-top: 4px;
+}
+.footer-updated {
+    font-variant-numeric: tabular-nums;
+}
 
 /* Responsive */
 @media (max-width: 800px) {
+    .topbar {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 10px;
+    }
+    .topbar-tools {
+        flex-direction: column;
+        align-items: stretch;
+    }
+    .locale-wrap {
+        justify-content: space-between;
+    }
     .layout { flex-direction: column; }
     .sidebar {
         width: 100%;
@@ -377,5 +473,8 @@ code {
         border-right: none;
         border-bottom: 1px solid var(--c-border);
     }
-    .search-wrap { width: 200px; }
+    .search-wrap {
+        width: 100%;
+        max-width: none;
+    }
 }

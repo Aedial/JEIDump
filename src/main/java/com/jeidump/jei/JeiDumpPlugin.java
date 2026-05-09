@@ -6,19 +6,23 @@ import mezz.jei.api.IJeiRuntime;
 import mezz.jei.api.IModPlugin;
 import mezz.jei.api.IModRegistry;
 import mezz.jei.api.JEIPlugin;
+import mezz.jei.api.ingredients.IIngredientRegistry;
 
 
 /**
  * Captures the {@link IJeiRuntime} given to us once JEI has finished registering everything.
  *
- * The runtime exposes {@code getRecipeRegistry()} and {@code getIngredientRegistry()} which is
- * everything we need to enumerate categories, recipes and ingredients.
+ * JEI hands us the stable registration-time {@link IIngredientRegistry} in
+ * {@link #register(IModRegistry)}, while {@link #onRuntimeAvailable(IJeiRuntime)} provides the
+ * live {@link IJeiRuntime} for recipe access.
  */
 @JEIPlugin
 public class JeiDumpPlugin implements IModPlugin {
 
     @Nullable
     private static IJeiRuntime runtime;
+    @Nullable
+    private static IIngredientRegistry ingredientRegistry;
 
     /**
      * Returns the captured JEI runtime, or {@code null} if JEI has not yet finished its post-init.
@@ -29,9 +33,17 @@ public class JeiDumpPlugin implements IModPlugin {
         return runtime;
     }
 
+    /**
+     * Returns JEI's ingredient registry captured during plugin registration.
+     */
+    @Nullable
+    public static IIngredientRegistry getIngredientRegistry() {
+        return ingredientRegistry;
+    }
+
     @Override
     public void register(IModRegistry registry) {
-        // Nothing to register; we're a passive consumer of the runtime.
+        ingredientRegistry = registry.getIngredientRegistry();
     }
 
     @Override

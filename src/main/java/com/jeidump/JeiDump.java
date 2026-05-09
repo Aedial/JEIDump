@@ -2,15 +2,18 @@ package com.jeidump;
 
 import net.minecraft.client.Minecraft;
 import net.minecraftforge.client.ClientCommandHandler;
+import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.common.event.FMLInitializationEvent;
 import net.minecraftforge.fml.common.event.FMLPreInitializationEvent;
 import net.minecraftforge.fml.relauncher.Side;
 import net.minecraftforge.fml.relauncher.SideOnly;
 
+import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import com.jeidump.command.CommandDumpJei;
+import com.jeidump.config.JeiDumpConfig;
 
 /**
  * Entry point for JEI Dump.
@@ -22,23 +25,21 @@ import com.jeidump.command.CommandDumpJei;
  * The mod itself only adds a command and a JEI plugin to capture {@code IJeiRuntime}; all heavy
  * lifting happens lazily when the command runs.
  */
-@Mod(modid = JeiDump.MOD_ID,
-    name = JeiDump.MOD_NAME,
-    version = JeiDump.VERSION,
+@Mod(modid = Tags.MODID,
+    name = Tags.MODNAME,
+    version = Tags.VERSION,
     acceptedMinecraftVersions = "[1.12.2,1.13)",
     dependencies = "required-after:jei@[4.16.0,);",
-    clientSideOnly = true)
+    clientSideOnly = true,
+    guiFactory = "com.jeidump.config.JeiDumpGuiFactory")
 public class JeiDump {
 
-    public static final String MOD_ID = "jeidump";
-    public static final String MOD_NAME = "JEI Dump";
-    public static final String VERSION = "1.0.0";
-
-    public static Logger LOGGER;
+    public static final Logger LOGGER = LogManager.getLogger(Tags.MODID);
 
     @Mod.EventHandler
     public void preInit(FMLPreInitializationEvent event) {
-        LOGGER = event.getModLog();
+        JeiDumpConfig.init(event.getSuggestedConfigurationFile());
+        MinecraftForge.EVENT_BUS.register(new JeiDumpConfig());
     }
 
     @Mod.EventHandler
