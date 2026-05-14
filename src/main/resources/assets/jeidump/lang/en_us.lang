@@ -68,6 +68,6 @@ jeidump.config.defaultRecipesPerTick.tooltip=Default number of recipes processed
 jeidump.config.recipeScale=Recipe Scale
 jeidump.config.recipeScale.tooltip=Pixel multiplier applied to recipe layout PNG renders. Higher values produce crisper images but use more disk space. Requires a new dump to take effect.
 jeidump.config.splitRecipeBackgrounds=Split Recipe Backgrounds
-jeidump.config.splitRecipeBackgrounds.tooltip=Extract shared recipe backgrounds into a separate image per category when that reduces the total dump size. Disable this to keep every recipe as a standalone PNG. May consume a lot during splitting, enable with caution on bigger modpacks.
+jeidump.config.splitRecipeBackgrounds.tooltip=Extract shared recipe backgrounds into a separate image per category when that reduces the total dump size. Disable this to keep every recipe as a standalone PNG. Runs best with a lot of memory allocated, as categories that are too large will be left unsplit to avoid out-of-memory crashes.
 jeidump.config.backgroundSplitImagesPerTick=Background Split Images Per Tick
 jeidump.config.backgroundSplitImagesPerTick.tooltip=Maximum number of background-splitting image operations processed per client tick after recipe rendering finishes. Lower values reduce hitching but make the split phase take longer.

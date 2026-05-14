@@ -117,7 +117,8 @@ public class JeiDumpConfig {
         p = config.get(CATEGORY_GENERAL,
             "splitRecipeBackgrounds", false,
             "Extract shared recipe backgrounds into a separate image per category when that reduces the total dump size. " +
-            "Disable this to keep every recipe as a standalone PNG. May consume a lot during splitting, enable with caution on bigger modpacks."
+            "Disable this to keep every recipe as a standalone PNG. Runs best with a lot of memory allocated, " +
+            "as categories that are too large will be left unsplit to avoid out-of-memory crashes. "
         );
         p.setLanguageKey(Tags.MODID + ".config.splitRecipeBackgrounds");
         splitRecipeBackgrounds = p.getBoolean();

@@ -12,6 +12,7 @@ A client-side Minecraft 1.12.2 mod that exports every JEI recipe (vanilla + ever
    /dumpjei myfolder     # writes to <gameDir>/jeidump/myfolder/
    ```
 4. The game may lag while it renders (should be unplayable for most people at default speed).
+5. To reduce the dump size (optimize for disk space at the cost of increased dump duration), you can enable background splitting in the config.
 
 When done, open `<gameDir>/jeidump/<folder>/index.html`.
 

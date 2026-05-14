@@ -8,6 +8,14 @@ The format is based on Keep a Changelog and this project adheres to Semantic Ver
 - Semantic Versioning: https://semver.org/spec/v2.0.0.html
 
 
+## [1.3.0] - 2025-05-08
+### Added
+- Merge exported anvil recipe cards when their visible slots only differ by item damage, which trims duplicate repair entries while keeping all exact ingredient pages linked to the surviving card.
+
+### Fixed
+- Limit recipe background splitting to half of the available memory, to avoid out-of-memory crashes on larger categories when that option is enabled. Categories that exceed the memory limit will be left unsplit.
+
+
 ## [1.2.1] - 2025-05-07
 ### Added
 - Add a gradle task to automatically generate the locale manifest from the bundled lang files.
