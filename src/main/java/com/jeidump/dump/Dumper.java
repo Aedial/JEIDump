@@ -85,9 +85,12 @@ import com.jeidump.i18n.JeiDumpLocales;
  *   index.html, assets/style.css, assets/app.js
  *   assets/lang/<locale>.lang, assets/lang/index.json, assets/lang/index.js
  *   data/manifest.json, data/manifest.js
- *   data/locales/<locale>/index.json
+ *   data/locales/<locale>/index.json, index.js
+ *   data/locales/<locale>/categories/<cat>/chunk_N.json, chunk_N.js (when chunking is enabled)
  *   data/locales/<locale>/categories/<cat>/background.png (when deduplication wins)
  *   data/locales/<locale>/categories/<cat>/recipe_N.png
+ *   data/locales/<locale>/resources/meta_<bucket>.json, meta_<bucket>.js (when chunking is enabled)
+ *   data/locales/<locale>/resources/refs_<bucket>.json, refs_<bucket>.js (when chunking is enabled)
  *   data/locales/<locale>/ingredients/<kind>/<id>.png
  * </pre>
  *
@@ -129,6 +132,11 @@ import com.jeidump.i18n.JeiDumpLocales;
  * <ul>
  *   <li>{@code generatedAt}: ISO-8601 timestamp captured once when the dump starts, used by the
  *       website footer.</li>
+ *   <li>When chunking is enabled, {@code categories} becomes summary-only and recipe payloads
+ *       move into per-category chunk files that the frontend loads on demand.</li>
+ *   <li>When chunking is enabled, {@code ingredients} becomes compact search metadata only and
+ *       full tooltip payloads plus grouped recipe refs move into bucket files keyed by a
+ *       deterministic id hash.</li>
  * </ul>
  */
 public class Dumper {
@@ -190,6 +198,12 @@ public class Dumper {
             this.translationKey = translationKey;
             this.className = className;
         }
+    }
+
+    /** Aggregate counts for the two ingredient navigation modes shown by the frontend. */
+    private static class IngredientRefCounts {
+        private int recipes;
+        private int uses;
     }
 
     /** Incremental category background split job. */
@@ -430,6 +444,14 @@ public class Dumper {
         "assets/jeidump/web/app.js:assets/app.js"
     };
 
+    private static final String DATASET_REGISTRY = "__JEI_DUMP_DATASETS";
+    private static final String CATEGORY_CHUNK_REGISTRY = "__JEI_DUMP_CATEGORY_CHUNKS";
+    private static final String INGREDIENT_META_BUCKET_REGISTRY = "__JEI_DUMP_INGREDIENT_META_BUCKETS";
+    private static final String INGREDIENT_REF_BUCKET_REGISTRY = "__JEI_DUMP_INGREDIENT_REF_BUCKETS";
+    private static final int CATEGORY_CHUNK_SIZE = 1000;
+    private static final int INGREDIENT_BUCKET_HEX_DIGITS = 2;
+    private static final int INGREDIENT_BUCKET_COUNT = 1 << (INGREDIENT_BUCKET_HEX_DIGITS * 4);
+
     /**
      * Logical pixels of empty space added on every side of every recipe layout PNG. Some JEI
      * categories (notably modded ones with long titles or arrows that extend past the
@@ -452,6 +474,7 @@ public class Dumper {
     private final JeiDumpConfig.ExportFormat exportFormat = JeiDumpConfig.getExportFormat();
     private final boolean emitTooltipHtml = exportFormat == JeiDumpConfig.ExportFormat.HTML;
     private final boolean preserveTooltipFormatting = exportFormat == JeiDumpConfig.ExportFormat.JSON;
+    private final boolean chunkDataFiles = JeiDumpConfig.isChunkDataFilesEnabled();
     private final boolean compactJsonSlots = exportFormat == JeiDumpConfig.ExportFormat.JSON
         && JeiDumpConfig.isCompactJsonSlotsEnabled();
     private final boolean splitRecipeBackgrounds = captureImages && JeiDumpConfig.splitRecipeBackgrounds;
@@ -499,7 +522,7 @@ public class Dumper {
     private static IFocus<ItemStack> fallbackFocus;
 
     // Phase state
-    private File dataDir, localesRoot, localeDataDir, catRoot, ingredientRoot;
+    private File dataDir, localesRoot, localeDataDir, catRoot, ingredientRoot, resourceRoot;
     @SuppressWarnings("rawtypes")
     private List<IRecipeCategory> categories;
     private int totalRecipes;
@@ -544,6 +567,7 @@ public class Dumper {
         localesRoot = new File(dataDir, "locales");
         localeDataDir = new File(localesRoot, dumpLocale);
         catRoot = new File(localeDataDir, "categories");
+        resourceRoot = new File(localeDataDir, "resources");
         ingredientRoot = new File(localeDataDir, "ingredients");
         if (!dataDir.mkdirs() && !dataDir.exists()) throw new IOException("Cannot create " + dataDir);
         if (!localesRoot.mkdirs() && !localesRoot.exists()) throw new IOException("Cannot create " + localesRoot);
@@ -552,6 +576,7 @@ public class Dumper {
         }
         if (!localeDataDir.mkdirs() && !localeDataDir.exists()) throw new IOException("Cannot create " + localeDataDir);
         catRoot.mkdirs();
+        resourceRoot.mkdirs();
         ingredientRoot.mkdirs();
         if (writesHtmlShell()) new File(outDir, "assets").mkdirs();
 
@@ -690,6 +715,11 @@ public class Dumper {
 
         JsonObject root = buildDataRoot();
         writeJson(root, new File(localeDataDir, "index.json"));
+        if (chunkDataFiles) {
+            writeCategoryChunks();
+            writeIngredientMetaBuckets();
+            writeIngredientRefBuckets();
+        }
 
         writeDataManifest();
 
@@ -1895,6 +1925,59 @@ public class Dumper {
     }
 
     private JsonObject buildDataRoot() {
+        if (!chunkDataFiles) return buildMonolithicDataRoot();
+
+        return buildChunkedDataRoot();
+    }
+
+    private JsonObject buildChunkedDataRoot() {
+        Map<String, Integer> categoryOrdinals = buildCategoryOrdinals();
+        Map<String, IngredientRefCounts> ingredientCounts = buildIngredientRefCounts();
+
+        JsonObject root = new JsonObject();
+        root.addProperty("locale", dumpLocale);
+        root.addProperty("generatedAt", generatedAt);
+        root.addProperty("outputFormat", exportFormat.getSerializedName());
+        root.addProperty("imagesCaptured", captureImages);
+        root.addProperty("categoryChunkSize", CATEGORY_CHUNK_SIZE);
+        root.addProperty("ingredientBucketHexDigits", INGREDIENT_BUCKET_HEX_DIGITS);
+        root.add("categories", buildCategorySummaries());
+
+        JsonObject categoryOrdinalsRoot = new JsonObject();
+        for (Map.Entry<String, Integer> entry : categoryOrdinals.entrySet()) {
+            categoryOrdinalsRoot.addProperty(entry.getKey(), entry.getValue());
+        }
+        root.add("categoryOrdinals", categoryOrdinalsRoot);
+
+        JsonObject ingredientKindsRoot = new JsonObject();
+        for (IngredientTypeState<?> state : ingredientTypes.values()) {
+            if (state.uniqueCount == 0) continue;
+
+            JsonObject kind = new JsonObject();
+            kind.addProperty("translationKey", state.labelKey);
+            kind.addProperty("className", state.type.getIngredientClass().getName());
+            kind.addProperty("count", state.uniqueCount);
+            ingredientKindsRoot.add(state.kind, kind);
+        }
+        for (Map.Entry<String, VirtualIngredientKindState> entry : virtualIngredientKinds.entrySet()) {
+            VirtualIngredientKindState state = entry.getValue();
+            if (state.uniqueCount == 0) continue;
+
+            JsonObject kind = new JsonObject();
+            kind.addProperty("translationKey", state.translationKey);
+            kind.addProperty("className", state.className);
+            kind.addProperty("count", state.uniqueCount);
+            ingredientKindsRoot.add(entry.getKey(), kind);
+        }
+        root.add("ingredientKinds", ingredientKindsRoot);
+
+        root.add("ingredients", buildIngredientSummaries(ingredientCounts));
+        root.add("ingredientMetaBuckets", buildDeclaredIngredientBuckets(ingredientMeta.keySet()));
+        root.add("ingredientRefBuckets", buildDeclaredIngredientBuckets(ingredientRecipes.keySet()));
+        return root;
+    }
+
+    private JsonObject buildMonolithicDataRoot() {
         JsonObject root = new JsonObject();
         root.addProperty("locale", dumpLocale);
         root.addProperty("generatedAt", generatedAt);
@@ -1925,17 +2008,267 @@ public class Dumper {
         root.add("ingredientKinds", ingredientKindsRoot);
 
         JsonObject ingredientsRoot = new JsonObject();
-        for (Map.Entry<String, JsonObject> e : ingredientMeta.entrySet()) {
-            ingredientsRoot.add(e.getKey(), e.getValue());
+        for (Map.Entry<String, JsonObject> entry : ingredientMeta.entrySet()) {
+            ingredientsRoot.add(entry.getKey(), copyJsonObject(entry.getValue()));
         }
         root.add("ingredients", ingredientsRoot);
 
         JsonObject ingredientRecipesRoot = new JsonObject();
-        for (Map.Entry<String, JsonArray> e : ingredientRecipes.entrySet()) {
-            ingredientRecipesRoot.add(e.getKey(), e.getValue());
+        for (Map.Entry<String, JsonArray> entry : ingredientRecipes.entrySet()) {
+            ingredientRecipesRoot.add(entry.getKey(), entry.getValue());
         }
         root.add("ingredientRecipes", ingredientRecipesRoot);
         return root;
+    }
+
+    private JsonArray buildCategorySummaries() {
+        JsonArray summaries = new JsonArray();
+        int ordinal = 0;
+        for (JsonElement categoryElement : categoriesJson) {
+            JsonObject category = categoryElement.getAsJsonObject();
+            JsonObject summary = new JsonObject();
+            int recipeCount = category.has("recipeCount")
+                ? category.get("recipeCount").getAsInt()
+                : categoryRecipeCount(category);
+
+            summary.add("id", category.get("id"));
+            summary.add("uid", category.get("uid"));
+            summary.add("title", category.get("title"));
+            summary.add("modName", category.get("modName"));
+            summary.addProperty("ordinal", ordinal++);
+            summary.addProperty("recipeCount", recipeCount);
+            summary.addProperty("chunkCount", chunkCountForRecipeCount(recipeCount));
+            if (category.has("backgroundImg")) summary.add("backgroundImg", category.get("backgroundImg"));
+
+            summaries.add(summary);
+        }
+
+        return summaries;
+    }
+
+    private Map<String, Integer> buildCategoryOrdinals() {
+        Map<String, Integer> ordinals = new LinkedHashMap<>();
+        int ordinal = 0;
+        for (JsonElement categoryElement : categoriesJson) {
+            JsonObject category = categoryElement.getAsJsonObject();
+            ordinals.put(category.get("id").getAsString(), ordinal++);
+        }
+
+        return ordinals;
+    }
+
+    private Map<String, IngredientRefCounts> buildIngredientRefCounts() {
+        Map<String, IngredientRefCounts> countsByIngredient = new LinkedHashMap<>();
+        for (Map.Entry<String, JsonArray> entry : ingredientRecipes.entrySet()) {
+            IngredientRefCounts counts = new IngredientRefCounts();
+            for (JsonElement refElement : entry.getValue()) {
+                JsonObject ref = refElement.getAsJsonObject();
+                String role = ref.get("role").getAsString();
+                if ("out".equals(role)) {
+                    counts.recipes++;
+                } else if ("in".equals(role)) {
+                    counts.uses++;
+                }
+            }
+
+            countsByIngredient.put(entry.getKey(), counts);
+        }
+
+        return countsByIngredient;
+    }
+
+    private JsonObject buildIngredientSummaries(Map<String, IngredientRefCounts> ingredientCounts) {
+        JsonObject summaries = new JsonObject();
+        for (Map.Entry<String, JsonObject> entry : ingredientMeta.entrySet()) {
+            JsonObject fullMeta = entry.getValue();
+            JsonObject summary = new JsonObject();
+            summary.add("name", fullMeta.get("name"));
+            summary.add("nameHtml", fullMeta.get("nameHtml"));
+            summary.add("mod", fullMeta.get("mod"));
+            if (fullMeta.has("img")) summary.add("img", fullMeta.get("img"));
+            summary.add("kind", fullMeta.get("kind"));
+
+            IngredientRefCounts counts = ingredientCounts.get(entry.getKey());
+            summary.addProperty("recipeCount", counts == null ? 0 : counts.recipes);
+            summary.addProperty("useCount", counts == null ? 0 : counts.uses);
+            summaries.add(entry.getKey(), summary);
+        }
+
+        return summaries;
+    }
+
+    private JsonArray buildDeclaredIngredientBuckets(Set<String> ingredientIds) {
+        Set<String> uniqueBuckets = new LinkedHashSet<>();
+        for (String ingredientId : ingredientIds) {
+            uniqueBuckets.add(ingredientBucketId(ingredientId));
+        }
+
+        List<String> bucketIds = new ArrayList<>(uniqueBuckets);
+        Collections.sort(bucketIds);
+
+        JsonArray buckets = new JsonArray();
+        for (String bucketId : bucketIds) {
+            buckets.add(bucketId);
+        }
+        return buckets;
+    }
+
+    private void writeCategoryChunks() throws IOException {
+        for (JsonElement categoryElement : categoriesJson) {
+            JsonObject category = categoryElement.getAsJsonObject();
+            JsonArray recipes = category.getAsJsonArray("recipes");
+            if (recipes == null || recipes.size() == 0) continue;
+
+            String categoryId = category.get("id").getAsString();
+            File categoryDir = new File(catRoot, categoryId);
+            if (!categoryDir.mkdirs() && !categoryDir.exists()) throw new IOException("Cannot create " + categoryDir);
+
+            int chunkIndex = 0;
+            for (int startIndex = 0; startIndex < recipes.size(); startIndex += CATEGORY_CHUNK_SIZE) {
+                JsonObject chunk = new JsonObject();
+                JsonArray chunkRecipes = new JsonArray();
+                int endIndex = Math.min(recipes.size(), startIndex + CATEGORY_CHUNK_SIZE);
+                for (int recipeIndex = startIndex; recipeIndex < endIndex; recipeIndex++) {
+                    chunkRecipes.add(recipes.get(recipeIndex));
+                }
+
+                chunk.addProperty("id", categoryId);
+                chunk.addProperty("chunkIndex", chunkIndex);
+                chunk.addProperty("start", startIndex);
+                chunk.add("recipes", chunkRecipes);
+
+                writeJson(chunk, new File(categoryDir, "chunk_" + chunkIndex + ".json"));
+                if (writesHtmlShell()) {
+                    writeCategoryChunkScript(chunk, new File(categoryDir, "chunk_" + chunkIndex + ".js"), dumpLocale, categoryId, chunkIndex);
+                }
+
+                chunkIndex++;
+            }
+        }
+    }
+
+    private void writeIngredientMetaBuckets() throws IOException {
+        Map<String, JsonObject> buckets = new LinkedHashMap<>();
+        for (Map.Entry<String, JsonObject> entry : ingredientMeta.entrySet()) {
+            String ingredientId = entry.getKey();
+            String bucketId = ingredientBucketId(ingredientId);
+            JsonObject payload = getOrCreateIngredientBucketPayload(buckets, bucketId);
+            JsonObject ingredientsRoot = payload.getAsJsonObject("ingredients");
+
+            JsonObject fullMeta = copyJsonObject(entry.getValue());
+            fullMeta.addProperty("id", ingredientId);
+            ingredientsRoot.add(ingredientId, fullMeta);
+        }
+
+        writeIngredientBucketFiles(buckets, "meta", INGREDIENT_META_BUCKET_REGISTRY);
+    }
+
+    private void writeIngredientRefBuckets() throws IOException {
+        Map<String, Integer> categoryOrdinals = buildCategoryOrdinals();
+        Map<String, JsonObject> buckets = new LinkedHashMap<>();
+
+        for (Map.Entry<String, JsonArray> entry : ingredientRecipes.entrySet()) {
+            String ingredientId = entry.getKey();
+            String bucketId = ingredientBucketId(ingredientId);
+            JsonObject payload = getOrCreateIngredientBucketPayload(buckets, bucketId);
+            JsonObject ingredientsRoot = payload.getAsJsonObject("ingredients");
+
+            JsonObject ingredientRefs = new JsonObject();
+            ingredientRefs.addProperty("id", ingredientId);
+
+            for (JsonElement refElement : entry.getValue()) {
+                JsonObject ref = refElement.getAsJsonObject();
+                Integer categoryOrdinal = categoryOrdinals.get(ref.get("cat").getAsString());
+                if (categoryOrdinal == null) continue;
+
+                String roleKey = "out".equals(ref.get("role").getAsString()) ? "recipes" : "uses";
+                addGroupedIngredientRef(ingredientRefs, roleKey, categoryOrdinal.intValue(), ref.get("idx").getAsInt());
+            }
+
+            ingredientsRoot.add(ingredientId, ingredientRefs);
+        }
+
+        writeIngredientBucketFiles(buckets, "refs", INGREDIENT_REF_BUCKET_REGISTRY);
+    }
+
+    private JsonObject getOrCreateIngredientBucketPayload(Map<String, JsonObject> buckets, String bucketId) {
+        JsonObject payload = buckets.get(bucketId);
+        if (payload != null) return payload;
+
+        payload = new JsonObject();
+        payload.addProperty("bucket", bucketId);
+        payload.add("ingredients", new JsonObject());
+        buckets.put(bucketId, payload);
+        return payload;
+    }
+
+    private void writeIngredientBucketFiles(Map<String, JsonObject> buckets, String filePrefix, String registryName)
+        throws IOException {
+        for (Map.Entry<String, JsonObject> entry : buckets.entrySet()) {
+            String bucketId = entry.getKey();
+            JsonObject payload = entry.getValue();
+
+            writeJson(payload, new File(resourceRoot, filePrefix + "_" + bucketId + ".json"));
+            if (writesHtmlShell()) {
+                writeLocaleBucketScript(
+                    payload,
+                    new File(resourceRoot, filePrefix + "_" + bucketId + ".js"),
+                    registryName,
+                    dumpLocale,
+                    bucketId
+                );
+            }
+        }
+    }
+
+    private void addGroupedIngredientRef(JsonObject ingredientRefs, String roleKey, int categoryOrdinal, int recipeIndex) {
+        JsonObject roleRoot = ingredientRefs.has(roleKey)
+            ? ingredientRefs.getAsJsonObject(roleKey)
+            : new JsonObject();
+        String categoryKey = Integer.toString(categoryOrdinal);
+        JsonObject categoryRoot = roleRoot.has(categoryKey)
+            ? roleRoot.getAsJsonObject(categoryKey)
+            : new JsonObject();
+        int chunkIndex = recipeIndex / CATEGORY_CHUNK_SIZE;
+        int localIndex = recipeIndex % CATEGORY_CHUNK_SIZE;
+        String chunkKey = Integer.toString(chunkIndex);
+        JsonArray chunkRefs = categoryRoot.has(chunkKey)
+            ? categoryRoot.getAsJsonArray(chunkKey)
+            : new JsonArray();
+
+        chunkRefs.add(localIndex);
+        categoryRoot.add(chunkKey, chunkRefs);
+        roleRoot.add(categoryKey, categoryRoot);
+        ingredientRefs.add(roleKey, roleRoot);
+    }
+
+    private static JsonObject copyJsonObject(JsonObject source) {
+        JsonObject copy = new JsonObject();
+        for (Map.Entry<String, JsonElement> entry : source.entrySet()) {
+            copy.add(entry.getKey(), entry.getValue());
+        }
+
+        return copy;
+    }
+
+    private static int categoryRecipeCount(JsonObject category) {
+        JsonArray recipes = category.getAsJsonArray("recipes");
+        return recipes == null ? 0 : recipes.size();
+    }
+
+    private static int chunkCountForRecipeCount(int recipeCount) {
+        if (recipeCount <= 0) return 0;
+
+        return (recipeCount + CATEGORY_CHUNK_SIZE - 1) / CATEGORY_CHUNK_SIZE;
+    }
+
+    private static String ingredientBucketId(String ingredientId) {
+        int bucket = (ingredientId.hashCode() & Integer.MAX_VALUE) % INGREDIENT_BUCKET_COUNT;
+        String hex = Integer.toHexString(bucket);
+        while (hex.length() < INGREDIENT_BUCKET_HEX_DIGITS) {
+            hex = "0" + hex;
+        }
+        return hex;
     }
 
     private boolean prepareBackgroundSplitTasks() {
@@ -2071,15 +2404,21 @@ public class Dumper {
         return "data/locales/" + dumpLocale + "/" + relativePath;
     }
 
-    private void writeJson(JsonObject root, File dst) throws IOException {
+    private void writeJson(JsonElement root, File dst) throws IOException {
         try (BufferedWriter bw = Files.newBufferedWriter(dst.toPath(), StandardCharsets.UTF_8)) {
             gson.toJson(root, bw);
         }
     }
 
-    private void writeLocaleDataScript(JsonObject root, File dst, String locale) throws IOException {
+    private void writeLocaleDataScript(JsonElement root, File dst, String locale) throws IOException {
         try (BufferedWriter bw = Files.newBufferedWriter(dst.toPath(), StandardCharsets.UTF_8)) {
-            bw.write("window.__JEI_DUMP_DATASETS = window.__JEI_DUMP_DATASETS || {};\nwindow.__JEI_DUMP_DATASETS[");
+            bw.write("window.");
+            bw.write(DATASET_REGISTRY);
+            bw.write(" = window.");
+            bw.write(DATASET_REGISTRY);
+            bw.write(" || {};\nwindow.");
+            bw.write(DATASET_REGISTRY);
+            bw.write("[");
             gson.toJson(locale, bw);
             bw.write("] = ");
             gson.toJson(root, bw);
@@ -2087,7 +2426,75 @@ public class Dumper {
         }
     }
 
-    private void writeGlobalScript(JsonObject root, File dst, String prefix) throws IOException {
+    private void writeCategoryChunkScript(JsonElement chunk, File dst, String locale, String categoryId, int chunkIndex)
+        throws IOException {
+        try (BufferedWriter bw = Files.newBufferedWriter(dst.toPath(), StandardCharsets.UTF_8)) {
+            bw.write("window.");
+            bw.write(CATEGORY_CHUNK_REGISTRY);
+            bw.write(" = window.");
+            bw.write(CATEGORY_CHUNK_REGISTRY);
+            bw.write(" || {};\nwindow.");
+            bw.write(CATEGORY_CHUNK_REGISTRY);
+            bw.write("[");
+            gson.toJson(locale, bw);
+            bw.write("] = window.");
+            bw.write(CATEGORY_CHUNK_REGISTRY);
+            bw.write("[");
+            gson.toJson(locale, bw);
+            bw.write("] || {};\nwindow.");
+            bw.write(CATEGORY_CHUNK_REGISTRY);
+            bw.write("[");
+            gson.toJson(locale, bw);
+            bw.write("][");
+            gson.toJson(categoryId, bw);
+            bw.write("] = window.");
+            bw.write(CATEGORY_CHUNK_REGISTRY);
+            bw.write("[");
+            gson.toJson(locale, bw);
+            bw.write("][");
+            gson.toJson(categoryId, bw);
+            bw.write("] || {};\nwindow.");
+            bw.write(CATEGORY_CHUNK_REGISTRY);
+            bw.write("[");
+            gson.toJson(locale, bw);
+            bw.write("][");
+            gson.toJson(categoryId, bw);
+            bw.write("][");
+            gson.toJson(chunkIndex, bw);
+            bw.write("] = ");
+            gson.toJson(chunk, bw);
+            bw.write(";\n");
+        }
+    }
+
+    private void writeLocaleBucketScript(JsonElement payload, File dst, String registryName, String locale, String bucketId)
+        throws IOException {
+        try (BufferedWriter bw = Files.newBufferedWriter(dst.toPath(), StandardCharsets.UTF_8)) {
+            bw.write("window.");
+            bw.write(registryName);
+            bw.write(" = window.");
+            bw.write(registryName);
+            bw.write(" || {};\nwindow.");
+            bw.write(registryName);
+            bw.write("[");
+            gson.toJson(locale, bw);
+            bw.write("] = window.");
+            bw.write(registryName);
+            bw.write("[");
+            gson.toJson(locale, bw);
+            bw.write("] || {};\nwindow.");
+            bw.write(registryName);
+            bw.write("[");
+            gson.toJson(locale, bw);
+            bw.write("][");
+            gson.toJson(bucketId, bw);
+            bw.write("] = ");
+            gson.toJson(payload, bw);
+            bw.write(";\n");
+        }
+    }
+
+    private void writeGlobalScript(JsonElement root, File dst, String prefix) throws IOException {
         try (BufferedWriter bw = Files.newBufferedWriter(dst.toPath(), StandardCharsets.UTF_8)) {
             bw.write(prefix);
             gson.toJson(root, bw);

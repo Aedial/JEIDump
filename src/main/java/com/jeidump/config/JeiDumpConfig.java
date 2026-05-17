@@ -17,6 +17,7 @@ import com.jeidump.Tags;
  * <ul>
  *   <li>Default number of recipes processed per client tick during a dump</li>
  *   <li>Recipe layout render scale (pixel multiplier for output PNGs)</li>
+ *   <li>Whether locale data is emitted as chunked files or as one monolithic payload</li>
  *   <li>Whether JSON exports should compact redundant slot metadata</li>
  *   <li>Whether recipe backgrounds should be split into shared per-category layers</li>
  *   <li>How many split-pass image operations may run per client tick</li>
@@ -84,6 +85,12 @@ public class JeiDumpConfig {
     private static ExportFormat exportFormat = ExportFormat.HTML;
 
     /**
+     * Whether locale data should be emitted as chunked category/resource files instead of one
+     * monolithic payload per locale.
+     */
+    private static boolean chunkDataFiles = true;
+
+    /**
      * Whether JSON exports should omit slot layout geometry and redundant list-backed slot
      * entries that add no tooltip override beyond inputs/outputs.
      */
@@ -138,6 +145,10 @@ public class JeiDumpConfig {
         return exportFormat;
     }
 
+    public static boolean isChunkDataFilesEnabled() {
+        return chunkDataFiles;
+    }
+
     public static boolean isCompactJsonSlotsEnabled() {
         return compactJsonSlots;
     }
@@ -185,6 +196,13 @@ public class JeiDumpConfig {
         p.setValidValues(EXPORT_FORMAT_VALUES);
         p.setLanguageKey(Tags.MODID + ".config.exportFormat");
         exportFormat = ExportFormat.fromSerializedName(p.getString());
+
+        p = config.get(CATEGORY_GENERAL,
+            "chunkDataFiles", true,
+            "Emit locale data as chunked category/resource files for both html and json exports. Disable this to use the monolithic per-locale payload for both formats."
+        );
+        p.setLanguageKey(Tags.MODID + ".config.chunkDataFiles");
+        chunkDataFiles = p.getBoolean();
 
         p = config.get(CATEGORY_GENERAL,
             "compactJsonSlots", false,

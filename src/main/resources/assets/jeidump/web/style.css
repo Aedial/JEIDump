@@ -350,6 +350,41 @@ code {
     font-weight: normal;
     margin-left: 6px;
 }
+.ing-section-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin: -2px 0 10px;
+}
+.ing-section-status {
+    color: var(--c-muted);
+    font-size: 12px;
+}
+.ing-section-more {
+    padding: 4px 10px;
+    border: 1px solid var(--c-border);
+    background: #fff;
+    border-radius: 3px;
+    cursor: pointer;
+    font: inherit;
+    color: var(--c-fg);
+}
+.ing-section-more:hover:not(:disabled) {
+    background: var(--c-row-hover);
+}
+.ing-section-more:disabled {
+    opacity: 0.6;
+    cursor: progress;
+}
+.ing-section-message {
+    margin: 0 0 12px;
+    color: var(--c-muted);
+    font-size: 12px;
+}
+.ing-section-message.is-error {
+    color: #aa0000;
+}
 .hdr-icon {
     width: 24px;
     height: 24px;

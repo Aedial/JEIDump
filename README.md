@@ -15,12 +15,15 @@ A client-side Minecraft 1.12.2 mod that exports every JEI recipe (vanilla + ever
 5. Configure the export in the mod config if needed:
    - `Capture Images`: disable this to skip recipe and ingredient PNG generation.
    - `Export Format`: choose `html` for the bundled browser UI or `json` for data-only output.
+   - `Chunk Data Files`: enable the chunked locale layout for both `html` and `json`, or disable it to use monolithic, per-locale payload for both formats.
    - `Compact JSON Slots`: when exporting `json`, omit slot layout coordinates and drop list-backed slot entries that add no data beyond `inputs` and `outputs`.
    - `Split Recipe Backgrounds`: optional disk-space optimization for image-enabled HTML dumps.
 
 When done, open `<gameDir>/jeidump/<folder>/index.html` for `html` exports, or read the JSON files under `<gameDir>/jeidump/<folder>/data/` for `json` exports.
 
 ## Output layout
+
+When `Chunk Data Files` is enabled:
 
 ```
 html mode:
@@ -29,15 +32,27 @@ assets/style.css
 assets/app.js
 data/manifest.json
 data/locales/<locale>/index.json
+data/locales/<locale>/index.js
+data/locales/<locale>/categories/<sanitized_uid>/chunk_N.json
+data/locales/<locale>/categories/<sanitized_uid>/chunk_N.js
 data/locales/<locale>/categories/<sanitized_uid>/recipe_N.png
+data/locales/<locale>/resources/meta_<bucket>.json
+data/locales/<locale>/resources/meta_<bucket>.js
+data/locales/<locale>/resources/refs_<bucket>.json
+data/locales/<locale>/resources/refs_<bucket>.js
 data/locales/<locale>/ingredients/<kind>/<dedup_id>.png
 
 json mode:
 data/manifest.json
 data/locales/<locale>/index.json
+data/locales/<locale>/categories/<sanitized_uid>/chunk_N.json
+data/locales/<locale>/resources/meta_<bucket>.json
+data/locales/<locale>/resources/refs_<bucket>.json
 ```
 
-The frontend is dependency-free: no lunr, no React, no build step. The "fuzzy" search is a lowercase substring + subsequence scorer that handles tens of thousands of entries in the browser without trouble.
+When `Chunk Data Files` is disabled, both HTML and JSON revert to the old monolithic locale payload in `data/locales/<locale>/index.json`, with HTML still mirroring that same payload into `index.js`.
+
+The frontend is dependency-free: no lunr, no React, no build step. In chunked mode the locale root stays summary-only, category recipes load from chunk files on demand, and ingredient pages join grouped refs back to those category chunks instead of eagerly materializing every matching recipe up front. In monolithic mode the bundled site falls back to the old eager in-memory behavior. The fuzzy search is a lowercase substring + subsequence scorer that can handle tens of thousands of entries in the browser without trouble.
 
 ## Configurable Tooltip Zones
 

@@ -13,6 +13,7 @@ The format is based on Keep a Changelog and this project adheres to Semantic Ver
 - Merge exported anvil recipe cards when their visible slots only differ by item damage, which trims duplicate repair entries while keeping all exact ingredient pages linked to the surviving card.
 - Add config option to skip image capture entirely.
 - Add config option to export JSON data without the bundled HTML frontend.
+- Add a chunked layout to lessen the load on the web browser by splitting data into smaller files, with a config option to switch both HTML and JSON exports between the chunked layout and the monolithic one.
 - Add a compact JSON slot export option that removes positional slot data and drops redundant list-backed slot entries.
 - Filter Ender IO tank dump noise by removing Forge fluid container helpers, including buckets, bottles, tanks, and similar fill-empty conversions, plus same-item repair wrappers.
 - Skip vanilla anvil same-item repair permutations before export.
