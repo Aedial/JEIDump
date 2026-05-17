@@ -53,6 +53,9 @@
         'jeidump.web.hint.ingredient': 'Hover a slot for tooltip. Left-click shows recipes that produce it. Right-click shows recipes that use it.',
         'jeidump.web.pager.prev': 'Prev',
         'jeidump.web.pager.next': 'Next',
+        'jeidump.web.pager.jump': 'Jump',
+        'jeidump.web.pager.jump.title': 'Jump to a page between %1$s and %2$s',
+        'jeidump.web.pager.go': 'Go',
         'jeidump.web.ingredient.heading.for': 'Recipes for',
         'jeidump.web.ingredient.heading.use': 'Uses of',
         'jeidump.web.ingredient.show.for': 'recipes that produce it',
@@ -370,21 +373,34 @@
             wrap.appendChild(buildRecipeLayer(backgroundImg, '', width, height, 'recipe-layer recipe-layer-bg'));
         }
 
-        wrap.appendChild(buildRecipeLayer(
-            recipe.img,
-            t('jeidump.web.recipe.alt', idx),
-            width,
-            height,
-            backgroundImg ? 'recipe-layer recipe-layer-fg' : 'recipe-layer'
-        ));
+        if (recipe.img) {
+            wrap.appendChild(buildRecipeLayer(
+                recipe.img,
+                t('jeidump.web.recipe.alt', idx),
+                width,
+                height,
+                backgroundImg ? 'recipe-layer recipe-layer-fg' : 'recipe-layer'
+            ));
+        } else {
+            wrap.appendChild(buildRecipePlaceholder(width, height));
+        }
 
         if (recipe.slots) {
             for (const slot of recipe.slots) {
+                if (!hasRenderableSlotBounds(slot)) continue;
+
                 const hotspot = node('a', 'hotspot');
                 hotspot.tabIndex = 0;
-                if (slot.id) hotspot.dataset.id = slot.id;
-                if (slot.kind) hotspot.dataset.kind = slot.kind;
-                if (slot.role) hotspot.dataset.role = slot.role;
+                if (slot.index) hotspot.dataset.index = slot.index;
+
+                const slotId = resolveSlotIngredientId(recipe, slot);
+                if (slotId) hotspot.dataset.id = slotId;
+
+                const slotKind = resolveSlotIngredientKind(slot, slotId);
+                if (slotKind) hotspot.dataset.kind = slotKind;
+
+                const slotRole = resolveSlotRole(slot);
+                if (slotRole) hotspot.dataset.role = slotRole;
                 // Keep structured tooltip overrides on the DOM node instead of serializing them
                 // through data-* attributes, which would force lossy escaping/parsing.
                 hotspot.jeiTooltip = slot.tooltip || null;
@@ -402,6 +418,53 @@
         return card;
     }
 
+    function hasRenderableSlotBounds(slot) {
+        return typeof slot.x === 'number'
+            && typeof slot.y === 'number'
+            && typeof slot.w === 'number'
+            && typeof slot.h === 'number';
+    }
+
+    function resolveSlotIngredientId(recipe, slot) {
+        if (slot.id) return slot.id;
+
+        const ref = parseSlotIndex(slot.index);
+        if (!ref) return '';
+
+        const ids = ref.role === 'in' ? recipe.inputs : recipe.outputs;
+        if (!Array.isArray(ids) || ref.position < 0 || ref.position >= ids.length) return '';
+
+        return ids[ref.position] || '';
+    }
+
+    function resolveSlotIngredientKind(slot, slotId) {
+        if (slot.kind) return slot.kind;
+
+        if (!slotId) return '';
+
+        const meta = DATA.ingredients[slotId];
+        return meta && meta.kind ? meta.kind : '';
+    }
+
+    function resolveSlotRole(slot) {
+        if (slot.role) return slot.role;
+
+        const ref = parseSlotIndex(slot.index);
+        return ref ? ref.role : '';
+    }
+
+    function parseSlotIndex(index) {
+        if (typeof index !== 'string') return null;
+
+        const match = /^(in|out)(\d+)$/.exec(index);
+        if (!match) return null;
+
+        return {
+            role: match[1],
+            position: parseInt(match[2], 10)
+        };
+    }
+
     function buildRecipeLayer(src, alt, width, height, className) {
         const image = node('img', className);
         image.src = src;
@@ -410,6 +473,13 @@
         image.width = width;
         image.height = height;
         return image;
+    }
+
+    function buildRecipePlaceholder(width, height) {
+        const placeholder = node('div', 'recipe-placeholder', t('jeidump.web.recipe.no_image'));
+        placeholder.style.width = width + 'px';
+        placeholder.style.height = height + 'px';
+        return placeholder;
     }
 
     /*
@@ -536,15 +606,13 @@
 
         const visible = pageButtons(page, totalPages);
         for (const entry of visible) {
-            if (entry === '...') {
-                const ellipsis = node('button', null, '...');
-                ellipsis.disabled = true;
-                pager.appendChild(ellipsis);
+            if (entry.type === 'gap') {
+                pager.appendChild(buildPagerJump(catId, entry.firstPage, entry.lastPage));
                 continue;
             }
 
-            const button = node('button', entry === page ? 'active' : null, String(entry + 1));
-            button.dataset.p = String(entry);
+            const button = node('button', entry.page === page ? 'active' : null, String(entry.page + 1));
+            button.dataset.p = String(entry.page);
             pager.appendChild(button);
         }
 
@@ -555,11 +623,111 @@
 
         pager.querySelectorAll('button[data-p]').forEach(button => {
             button.addEventListener('click', function () {
-                location.hash = 'cat=' + encodeURIComponent(catId) + '&p=' + this.dataset.p;
+                jumpToCategoryPage(catId, parseInt(this.dataset.p, 10));
             });
         });
 
         return pager;
+    }
+
+    /*
+     * Keep long pagers compact by turning each skipped range into a tiny inline jump form.
+     * The control stays as "..." until focused, then expands just enough to enter a page number.
+     */
+    function buildPagerJump(catId, firstPage, lastPage) {
+        const jump = node('div', 'pager-jump');
+        const toggle = node('button', 'pager-jump-toggle', '...');
+        const form = node('form', 'pager-jump-form');
+        const input = node('input', 'pager-jump-input');
+        const go = node('button', 'pager-jump-go', t('jeidump.web.pager.go'));
+        const minPage = firstPage + 1;
+        const maxPage = lastPage + 1;
+        const title = t('jeidump.web.pager.jump.title', minPage, maxPage);
+
+        toggle.type = 'button';
+        toggle.title = title;
+        toggle.setAttribute('aria-label', title);
+
+        form.hidden = true;
+        form.noValidate = true;
+
+        input.type = 'number';
+        input.inputMode = 'numeric';
+        input.min = String(minPage);
+        input.max = String(maxPage);
+        input.step = '1';
+        input.placeholder = minPage + '-' + maxPage;
+        input.title = title;
+        input.setAttribute('aria-label', t('jeidump.web.pager.jump') + ' ' + minPage + '-' + maxPage);
+        input.style.width = Math.max(4, String(maxPage).length + 1) + 'ch';
+
+        go.type = 'submit';
+        go.title = title;
+
+        form.appendChild(input);
+        form.appendChild(go);
+        jump.appendChild(toggle);
+        jump.appendChild(form);
+
+        toggle.addEventListener('click', () => {
+            if (jump.classList.contains('active')) {
+                closePagerJump(jump, form, input);
+                return;
+            }
+
+            jump.classList.add('active');
+            form.hidden = false;
+            input.value = '';
+            input.focus();
+        });
+
+        form.addEventListener('submit', event => {
+            event.preventDefault();
+
+            const targetPage = parsePagerJumpValue(input.value, minPage, maxPage);
+            if (targetPage === null) {
+                input.focus();
+                input.select();
+                return;
+            }
+
+            jumpToCategoryPage(catId, targetPage - 1);
+        });
+
+        input.addEventListener('keydown', event => {
+            if (event.key !== 'Escape') return;
+
+            event.preventDefault();
+            closePagerJump(jump, form, input);
+            toggle.focus();
+        });
+
+        jump.addEventListener('focusout', () => {
+            window.setTimeout(() => {
+                if (jump.contains(document.activeElement)) return;
+
+                closePagerJump(jump, form, input);
+            }, 0);
+        });
+
+        return jump;
+    }
+
+    function closePagerJump(jump, form, input) {
+        jump.classList.remove('active');
+        form.hidden = true;
+        input.value = '';
+    }
+
+    function parsePagerJumpValue(value, minPage, maxPage) {
+        const trimmed = String(value || '').trim();
+        if (!trimmed) return null;
+
+        const page = parseInt(trimmed, 10);
+        if (!Number.isFinite(page)) return null;
+        if (page < minPage || page > maxPage) return null;
+
+        return page;
     }
 
     /**
@@ -692,8 +860,15 @@
         const sorted = Array.from(out).filter(value => value >= 0 && value < total).sort((left, right) => left - right);
         const result = [];
         for (let i = 0; i < sorted.length; i++) {
-            if (i > 0 && sorted[i] !== sorted[i - 1] + 1) result.push('...');
-            result.push(sorted[i]);
+            if (i > 0 && sorted[i] !== sorted[i - 1] + 1) {
+                result.push({
+                    type: 'gap',
+                    firstPage: sorted[i - 1] + 1,
+                    lastPage: sorted[i] - 1
+                });
+            }
+
+            result.push({ type: 'page', page: sorted[i] });
         }
         return result;
     }
@@ -841,6 +1016,10 @@
      */
     function jumpTo(id, mode) {
         location.hash = 'ing=' + encodeURIComponent(id) + '&mode=' + (mode === 'use' ? 'use' : 'for');
+    }
+
+    function jumpToCategoryPage(catId, page) {
+        location.hash = 'cat=' + encodeURIComponent(catId) + '&p=' + page;
     }
 
     /** Wire hotspot hover (tooltip) + left-click (recipes-for) + right-click (uses-of). */

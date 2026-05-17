@@ -95,12 +95,14 @@ import com.jeidump.i18n.JeiDumpLocales;
  * <ul>
  *   <li>{@code img}: the full recipe PNG, or the per-recipe foreground layer when the category
  *       also exposes {@code backgroundImg}.</li>
- *   <li>{@code slots}: array of {@code {x,y,w,h,id,kind,role}} so the frontend can overlay
- *       hotspots that exactly match JEI's layout for hover/tooltip + click navigation. Slots may
- *       point at real JEI ingredients or synthetic recipe details such as Botania mana costs.
- *       Slots may also carry {@code tooltip}/{@code tooltipHtml} overrides when the live JEI
- *       tooltip for that stack differs from the shared ingredient metadata, for example fluids
- *       with different amounts.</li>
+ *   <li>{@code slots}: array of hotspot records. Standard JEI ingredient slots use
+ *       {@code {x,y,w,h,index}} where {@code index} points at {@code inputs}/{@code outputs}
+ *       with keys such as {@code in0} or {@code out2}; synthetic recipe details such as Botania
+ *       mana costs still use explicit {@code id}/{@code kind}/{@code role}. Slots may also carry
+ *       {@code tooltip}/{@code tooltipHtml} overrides when the live JEI tooltip for that stack
+ *       differs from the shared ingredient metadata, for example fluids with different amounts.
+ *       In compact JSON mode, layout coordinates are omitted and ingredient-backed slots that add
+ *       no extra tooltip data are dropped entirely.</li>
  * </ul>
  *
  * Per-category JSON may also include:
@@ -113,11 +115,11 @@ import com.jeidump.i18n.JeiDumpLocales;
  * <ul>
  *   <li>{@code nameHtml}: ingredient display name with Minecraft formatting codes converted to
  *       HTML spans for the frontend.</li>
- *   <li>{@code tooltip}: array of plain strings (slot-aware JEI NORMAL tooltip, color codes
- *       stripped),
- *       used for search keys and plain-text fallbacks.</li>
+ *   <li>{@code tooltip}: array of slot-aware JEI NORMAL tooltip lines. HTML exports strip color
+ *       codes here and pair them with {@code tooltipHtml}; JSON exports keep the original
+ *       Minecraft {@code §} formatting codes and omit {@code tooltipHtml}.</li>
  *   <li>{@code tooltipHtml}: array of tooltip lines with Minecraft formatting codes converted to
- *       HTML spans for the frontend.</li>
+ *       HTML spans for the frontend. Only written for HTML exports.</li>
  *   <li>{@code kind}: ingredient type key, so the frontend can label arbitrary JEI ingredient
  *       kinds without hardcoding item/fluid buckets. Synthetic recipe details can omit
  *       {@code img} when they do not have a standalone icon.</li>
@@ -171,8 +173,9 @@ public class Dumper {
         }
     }
 
-    /** Plain-text and HTML tooltip payload generated from the same JEI tooltip lines. */
+    /** Raw, plain-text, and HTML tooltip payload generated from the same JEI tooltip lines. */
     private static class TooltipText {
+        private final JsonArray raw = new JsonArray();
         private final JsonArray plain = new JsonArray();
         private final JsonArray html = new JsonArray();
     }
@@ -239,7 +242,7 @@ public class Dumper {
         }
     }
 
-    /** Lightweight item-only capture of wrapper ingredients used for pre-render anvil dedupe. */
+    /** Lightweight item-only capture of wrapper ingredients used for recipe filters and anvil dedupe. */
     private static class CapturedIngredients implements IIngredients {
         private List<List<ItemStack>> itemInputs = new ArrayList<>();
         private List<List<ItemStack>> itemOutputs = new ArrayList<>();
@@ -445,7 +448,13 @@ public class Dumper {
     private final DumpIntegrations integrations = DumpIntegrations.createDefault();
     private final String dumpLocale = JeiDumpLocales.getCurrentLocaleCode();
     private final String generatedAt = Instant.now().toString();
-    private final boolean splitRecipeBackgrounds = JeiDumpConfig.splitRecipeBackgrounds;
+    private final boolean captureImages = JeiDumpConfig.isImageCaptureEnabled();
+    private final JeiDumpConfig.ExportFormat exportFormat = JeiDumpConfig.getExportFormat();
+    private final boolean emitTooltipHtml = exportFormat == JeiDumpConfig.ExportFormat.HTML;
+    private final boolean preserveTooltipFormatting = exportFormat == JeiDumpConfig.ExportFormat.JSON;
+    private final boolean compactJsonSlots = exportFormat == JeiDumpConfig.ExportFormat.JSON
+        && JeiDumpConfig.isCompactJsonSlotsEnabled();
+    private final boolean splitRecipeBackgrounds = captureImages && JeiDumpConfig.splitRecipeBackgrounds;
 
     /** Real and virtual ingredient metadata keyed by globally unique id. */
     private final Map<String, JsonObject> ingredientMeta = new LinkedHashMap<>();
@@ -544,7 +553,7 @@ public class Dumper {
         if (!localeDataDir.mkdirs() && !localeDataDir.exists()) throw new IOException("Cannot create " + localeDataDir);
         catRoot.mkdirs();
         ingredientRoot.mkdirs();
-        new File(outDir, "assets").mkdirs();
+        if (writesHtmlShell()) new File(outDir, "assets").mkdirs();
 
         IRecipeRegistry rr = runtime.getRecipeRegistry();
         categories = rr.getRecipeCategories();
@@ -616,8 +625,10 @@ public class Dumper {
             try {
                 IRecipeLayoutDrawable layout = createLayoutWithRetry(rr, currentCategory, wrapper);
                 if (layout != null) {
-                    File pngFile = new File(currentCatFolder, "recipe_" + wrapperIdx + ".png");
-                    renderer.renderRecipeLayout(layout, currentBgW, currentBgH, RECIPE_PADDING, pngFile);
+                    if (captureImages) {
+                        File pngFile = new File(currentCatFolder, "recipe_" + wrapperIdx + ".png");
+                        renderer.renderRecipeLayout(layout, currentBgW, currentBgH, RECIPE_PADDING, pngFile);
+                    }
 
                     // Logical canvas size including the padding band. The PNG file itself is this
                     // size multiplied by IconRenderer.RECIPE_SCALE, but the frontend works in
@@ -628,7 +639,9 @@ public class Dumper {
                     JsonObject recObj = new JsonObject();
                     // During the final deduplication pass this file may be rewritten in place as
                     // a foreground-only layer if the shared background split is smaller on disk.
-                    recObj.addProperty("img", localeDataPath("categories/" + currentCatId + "/recipe_" + wrapperIdx + ".png"));
+                    if (captureImages) {
+                        recObj.addProperty("img", localeDataPath("categories/" + currentCatId + "/recipe_" + wrapperIdx + ".png"));
+                    }
                     recObj.addProperty("w", canvasW);
                     recObj.addProperty("h", canvasH);
                     // Pixel multiplier baked into the PNG. The frontend uses this to display the
@@ -677,22 +690,27 @@ public class Dumper {
 
         JsonObject root = buildDataRoot();
         writeJson(root, new File(localeDataDir, "index.json"));
-        writeLocaleDataScript(root, new File(localeDataDir, "index.js"), dumpLocale);
 
         writeDataManifest();
-        writeLangBundle();
 
-        for (String pair : RESOURCE_FILES) {
-            int colon = pair.indexOf(':');
-            String src = pair.substring(0, colon);
-            File dst = new File(outDir, pair.substring(colon + 1));
-            copyResource(src, dst);
+        if (writesHtmlShell()) {
+            writeLocaleDataScript(root, new File(localeDataDir, "index.js"), dumpLocale);
+            writeLangBundle();
+
+            for (String pair : RESOURCE_FILES) {
+                int colon = pair.indexOf(':');
+                String src = pair.substring(0, colon);
+                File dst = new File(outDir, pair.substring(colon + 1));
+                copyResource(src, dst);
+            }
         }
 
         result.iconCount = countRenderedIngredientIcons();
 
         long finalDumpBytes = measureTreeBytes(outDir.toPath());
-        if (!splitRecipeBackgrounds) {
+        if (!captureImages) {
+            CommandDumpJei.info(sender, "jeidump.command.images.disabled");
+        } else if (!splitRecipeBackgrounds) {
             CommandDumpJei.info(sender, "jeidump.command.dedup.disabled");
         } else if (dedupSavedBytes > 0L) {
             long originalDumpBytes = finalDumpBytes + dedupSavedBytes;
@@ -723,7 +741,9 @@ public class Dumper {
     @SuppressWarnings({"rawtypes", "unchecked"})
     private List<RecipeWorkItem> buildRecipeWorkItems(IRecipeCategory<?> category, List<IRecipeWrapper> wrappers) {
         List<RecipeWorkItem> workItems = new ArrayList<>();
-        if (!VanillaRecipeCategoryUid.ANVIL.equals(category.getUid())) {
+        boolean anvilCategory = VanillaRecipeCategoryUid.ANVIL.equals(category.getUid());
+        boolean integrationFilters = integrations.maySkipRecipes(category);
+        if (!anvilCategory && !integrationFilters) {
             for (IRecipeWrapper wrapper : wrappers) workItems.add(new RecipeWorkItem(wrapper));
 
             return workItems;
@@ -732,6 +752,15 @@ public class Dumper {
         Map<String, RecipeWorkItem> byMergeKey = new LinkedHashMap<>();
         for (IRecipeWrapper wrapper : wrappers) {
             CapturedIngredients ingredients = captureIngredients(wrapper);
+            if (integrationFilters && integrations.shouldSkipRecipe(category, wrapper, ingredients)) continue;
+
+            if (!anvilCategory) {
+                workItems.add(new RecipeWorkItem(wrapper));
+                continue;
+            }
+
+            if (shouldSkipAnvilRepairRecipe(ingredients)) continue;
+
             String mergeKey = buildCapturedAnvilMergeKey(ingredients);
             if (mergeKey == null) {
                 workItems.add(new RecipeWorkItem(wrapper));
@@ -756,6 +785,62 @@ public class Dumper {
         CapturedIngredients ingredients = new CapturedIngredients();
         wrapper.getIngredients(ingredients);
         return ingredients;
+    }
+
+    /**
+     * Skip pure item-plus-same-item anvil repairs before dedupe so the dump keeps only
+     * transformational anvil recipes instead of tens of thousands of durability permutations.
+     */
+    private static boolean shouldSkipAnvilRepairRecipe(CapturedIngredients ingredients) {
+        List<ItemStack> inputs = collectPrimaryItemStacks(ingredients.getItemInputs());
+        List<ItemStack> outputs = collectPrimaryItemStacks(ingredients.getItemOutputs());
+        if (inputs.size() != 2 || outputs.size() != 1) return false;
+
+        ItemStack left = inputs.get(0);
+        ItemStack right = inputs.get(1);
+        ItemStack output = outputs.get(0);
+        if (!isRepairableStack(left) || !isRepairableStack(right) || !isRepairableStack(output)) {
+            return false;
+        }
+
+        if (!isSameRepairRecipeItem(left, right)) return false;
+
+        return isSameRepairRecipeItem(left, output);
+    }
+
+    private static List<ItemStack> collectPrimaryItemStacks(List<List<ItemStack>> slots) {
+        List<ItemStack> primaryStacks = new ArrayList<>();
+        for (List<ItemStack> slot : slots) {
+            ItemStack primary = firstPresentItemStack(slot);
+            if (primary == null) continue;
+
+            primaryStacks.add(primary);
+        }
+
+        return primaryStacks;
+    }
+
+    @Nullable
+    private static ItemStack firstPresentItemStack(List<ItemStack> slot) {
+        for (ItemStack stack : slot) {
+            if (stack == null || stack.isEmpty()) continue;
+
+            return stack;
+        }
+
+        return null;
+    }
+
+    private static boolean isRepairableStack(ItemStack stack) {
+        return !stack.isEmpty() && stack.isItemStackDamageable();
+    }
+
+    /**
+     * Repair wrappers vary by damage and sometimes NBT, but they still collapse to the same
+     * user-facing recipe family once the underlying damageable item matches.
+     */
+    private static boolean isSameRepairRecipeItem(ItemStack left, ItemStack right) {
+        return !left.isEmpty() && !right.isEmpty() && left.getItem() == right.getItem();
     }
 
     @Nullable
@@ -1083,8 +1168,9 @@ public class Dumper {
 
             String primaryId = registerIngredient(state, primary, ingredient);
             recipeRecord.mergeSlotKeys.add(buildRecipeMergeSlotKey(state, ingredient, primary));
-            (ingredient.isInput() ? inputs : outputs).add(new JsonPrimitive(primaryId));
-            addSlot(slots, ingredient, primaryId, state.kind, RECIPE_PADDING,
+            JsonArray recipeIngredients = ingredient.isInput() ? inputs : outputs;
+            recipeIngredients.add(new JsonPrimitive(primaryId));
+            addSlot(slots, ingredient, buildSlotIndex(ingredient.isInput(), recipeIngredients.size() - 1), RECIPE_PADDING,
                 buildSlotTooltipOverride(primaryId, buildIngredientTooltip(state, ingredient, primary)));
 
             Set<String> indexedIds = new LinkedHashSet<>();
@@ -1204,7 +1290,9 @@ public class Dumper {
         }
 
         String fileStem = fileStemFor(id);
-        renderer.renderIngredientIcon(state.renderer, ingredient, new File(state.rootDir, fileStem + ".png"));
+        if (captureImages) {
+            renderer.renderIngredientIcon(state.renderer, ingredient, new File(state.rootDir, fileStem + ".png"));
+        }
 
         String displayName = safeDisplayName(state, ingredient);
         TooltipText tooltip = buildIngredientTooltip(state, guiIngredient, ingredient);
@@ -1213,10 +1301,11 @@ public class Dumper {
         meta.addProperty("name", stripFormatting(displayName));
         meta.addProperty("nameHtml", formatMinecraftTextToHtml(displayName));
         meta.addProperty("mod", safeModId(state, ingredient));
-        meta.addProperty("img", localeDataPath("ingredients/" + state.kind + "/" + fileStem + ".png"));
+        if (captureImages) {
+            meta.addProperty("img", localeDataPath("ingredients/" + state.kind + "/" + fileStem + ".png"));
+        }
         meta.addProperty("kind", state.kind);
-        meta.add("tooltip", tooltip.plain);
-        meta.add("tooltipHtml", tooltip.html);
+        addSerializedTooltip(meta, tooltip);
         ingredientMeta.put(id, meta);
         state.uniqueCount++;
         return id;
@@ -1305,6 +1394,7 @@ public class Dumper {
 
     private static void addTooltipLines(TooltipText tooltip, List<String> lines) {
         for (String line : lines) {
+            tooltip.raw.add(new JsonPrimitive(line));
             tooltip.plain.add(new JsonPrimitive(stripFormatting(line)));
             tooltip.html.add(new JsonPrimitive(formatMinecraftTextToHtml(line)));
         }
@@ -1322,12 +1412,15 @@ public class Dumper {
     private TooltipText buildSlotTooltipOverride(String ingredientId, TooltipText slotTooltip) {
         JsonObject meta = ingredientMeta.get(ingredientId);
         if (meta == null) return slotTooltip;
-        if (jsonArraysEqual(meta.getAsJsonArray("tooltip"), slotTooltip.plain)
-            && jsonArraysEqual(meta.getAsJsonArray("tooltipHtml"), slotTooltip.html)) {
-            return null;
+        if (!jsonArraysEqual(meta.getAsJsonArray("tooltip"), serializeTooltip(slotTooltip))) {
+            return slotTooltip;
         }
 
-        return slotTooltip;
+        if (emitTooltipHtml && !jsonArraysEqual(meta.getAsJsonArray("tooltipHtml"), slotTooltip.html)) {
+            return slotTooltip;
+        }
+
+        return null;
     }
 
     private static boolean jsonArraysEqual(@Nullable JsonArray left, @Nullable JsonArray right) {
@@ -1363,6 +1456,7 @@ public class Dumper {
 
         if (tooltip.plain.size() == 0) {
             String displayName = safeDisplayName(state, ingredient);
+            tooltip.raw.add(new JsonPrimitive(displayName));
             tooltip.plain.add(new JsonPrimitive(stripFormatting(displayName)));
             tooltip.html.add(new JsonPrimitive(formatMinecraftTextToHtml(displayName)));
         }
@@ -1573,6 +1667,15 @@ public class Dumper {
         return id;
     }
 
+    private JsonArray serializeTooltip(TooltipText tooltip) {
+        return preserveTooltipFormatting ? tooltip.raw : tooltip.plain;
+    }
+
+    private void addSerializedTooltip(JsonObject target, TooltipText tooltip) {
+        target.add("tooltip", serializeTooltip(tooltip));
+        if (emitTooltipHtml) target.add("tooltipHtml", tooltip.html);
+    }
+
     private void addInverted(String id, String catId, int recipeIdx, String role, String kind) {
         String refKey = catId + '\n' + recipeIdx + '\n' + role;
         Set<String> seenKeys = ingredientRecipeKeys.get(id);
@@ -1623,51 +1726,55 @@ public class Dumper {
     }
 
     /**
-     * Append a slot rect to the per-recipe slots array, if we can read the rect via reflection.
-     * The rect is shifted by {@code padding} on both axes because the recipe layout is drawn at
-     * {@code (padding, padding)} on the padded canvas; without the offset the frontend hotspots
-     * would land in the empty band on the top-left of the image.
+     * Append a slot record to the per-recipe slots array. Standard JEI ingredient slots point at
+     * the recipe's inputs/outputs through {@code index}; synthetic zones keep explicit
+     * ingredient ids.
      */
-    private static void addSlot(JsonArray slots, IGuiIngredient<?> ig, String id, String kind, int padding,
-                                @Nullable TooltipText tooltipOverride) {
+    private void addSlot(JsonArray slots, IGuiIngredient<?> ig, String index, int padding,
+                         @Nullable TooltipText tooltipOverride) {
         Rectangle r = readRect(ig);
-        if (r == null) return;
+        if (!compactJsonSlots && r == null) return;
+
         JsonObject slot = new JsonObject();
-        slot.addProperty("x", r.x + padding);
-        slot.addProperty("y", r.y + padding);
-        slot.addProperty("w", r.width);
-        slot.addProperty("h", r.height);
-        slot.addProperty("id", id);
-        slot.addProperty("kind", kind);
-        slot.addProperty("role", ig.isInput() ? "in" : "out");
-        if (tooltipOverride != null) {
-            slot.add("tooltip", tooltipOverride.plain);
-            slot.add("tooltipHtml", tooltipOverride.html);
+        if (!compactJsonSlots && r != null) {
+            slot.addProperty("x", r.x + padding);
+            slot.addProperty("y", r.y + padding);
+            slot.addProperty("w", r.width);
+            slot.addProperty("h", r.height);
         }
+        slot.addProperty("index", index);
+        if (tooltipOverride != null) addSerializedTooltip(slot, tooltipOverride);
+
+        if (compactJsonSlots && isRedundantIndexedSlot(slot)) return;
+
         slots.add(slot);
     }
 
-    private static void addExtraZone(JsonArray slots, RecipeDumpIntegration.Zone zone, @Nullable String id,
-                                     @Nullable String kind, @Nullable TooltipText tooltipOverride) {
+    private void addExtraZone(JsonArray slots, RecipeDumpIntegration.Zone zone, @Nullable String id,
+                              @Nullable String kind, @Nullable TooltipText tooltipOverride) {
         JsonObject slot = new JsonObject();
-        slot.addProperty("x", zone.x + RECIPE_PADDING);
-        slot.addProperty("y", zone.y + RECIPE_PADDING);
-        slot.addProperty("w", zone.width);
-        slot.addProperty("h", zone.height);
-        if (id != null) {
-            slot.addProperty("id", id);
+        if (!compactJsonSlots) {
+            slot.addProperty("x", zone.x + RECIPE_PADDING);
+            slot.addProperty("y", zone.y + RECIPE_PADDING);
+            slot.addProperty("w", zone.width);
+            slot.addProperty("h", zone.height);
         }
-        if (kind != null) {
-            slot.addProperty("kind", kind);
-        }
-        if (zone.role != null) {
-            slot.addProperty("role", zone.role);
-        }
-        if (tooltipOverride != null) {
-            slot.add("tooltip", tooltipOverride.plain);
-            slot.add("tooltipHtml", tooltipOverride.html);
-        }
+        if (id != null) slot.addProperty("id", id);
+        if (kind != null) slot.addProperty("kind", kind);
+        if (zone.role != null) slot.addProperty("role", zone.role);
+        if (tooltipOverride != null) addSerializedTooltip(slot, tooltipOverride);
+
+        if (slot.entrySet().isEmpty()) return;
+
         slots.add(slot);
+    }
+
+    private static String buildSlotIndex(boolean input, int index) {
+        return (input ? "in" : "out") + index;
+    }
+
+    private static boolean isRedundantIndexedSlot(JsonObject slot) {
+        return slot.entrySet().size() == 1 && slot.has("index");
     }
 
     private static <T> String buildRecipeMergeSlotKey(IngredientTypeState<T> state, IGuiIngredient<T> ingredient, T primary) {
@@ -1791,6 +1898,8 @@ public class Dumper {
         JsonObject root = new JsonObject();
         root.addProperty("locale", dumpLocale);
         root.addProperty("generatedAt", generatedAt);
+        root.addProperty("outputFormat", exportFormat.getSerializedName());
+        root.addProperty("imagesCaptured", captureImages);
         root.add("categories", categoriesJson);
 
         JsonObject ingredientKindsRoot = new JsonObject();
@@ -1897,13 +2006,17 @@ public class Dumper {
     private void writeDataManifest() throws IOException {
         JsonObject manifest = new JsonObject();
         manifest.addProperty("latestDumpLocale", dumpLocale);
+        manifest.addProperty("outputFormat", exportFormat.getSerializedName());
+        manifest.addProperty("imagesCaptured", captureImages);
 
         JsonArray availableDataLocales = new JsonArray();
         for (String locale : listAvailableDataLocales()) availableDataLocales.add(locale);
         manifest.add("availableDataLocales", availableDataLocales);
 
         writeJson(manifest, new File(dataDir, "manifest.json"));
-        writeGlobalScript(manifest, new File(dataDir, "manifest.js"), "window.__JEI_DUMP_MANIFEST = ");
+        if (writesHtmlShell()) {
+            writeGlobalScript(manifest, new File(dataDir, "manifest.js"), "window.__JEI_DUMP_MANIFEST = ");
+        }
     }
 
     /** Copy the bundled lang files and emit a JS-friendly translation table for the website. */
@@ -1988,6 +2101,10 @@ public class Dumper {
             if (meta.has("img")) count++;
         }
         return count;
+    }
+
+    private boolean writesHtmlShell() {
+        return exportFormat == JeiDumpConfig.ExportFormat.HTML;
     }
 
     private static String formatMiB(long bytes) {

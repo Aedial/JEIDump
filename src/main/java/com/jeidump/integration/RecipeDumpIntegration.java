@@ -6,6 +6,7 @@ import java.util.List;
 
 import javax.annotation.Nullable;
 
+import mezz.jei.api.ingredients.IIngredients;
 import mezz.jei.api.recipe.IRecipeCategory;
 import mezz.jei.api.recipe.IRecipeWrapper;
 
@@ -20,6 +21,19 @@ public interface RecipeDumpIntegration {
 
     List<Zone> collectZones(IRecipeCategory<?> category, IRecipeWrapper wrapper)
         throws ReflectiveOperationException;
+
+    default boolean maySkipRecipe(IRecipeCategory<?> category) {
+        return false;
+    }
+
+    /**
+     * Allows integrations to suppress noisy wrappers before the dumper counts or renders them.
+     * The current ingredient snapshot only guarantees populated item-stack slots.
+     */
+    default boolean shouldSkipRecipe(IRecipeCategory<?> category, IRecipeWrapper wrapper,
+                                     IIngredients ingredients) {
+        return false;
+    }
 
     final class Zone {
         public final int x;

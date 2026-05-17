@@ -12,13 +12,18 @@ A client-side Minecraft 1.12.2 mod that exports every JEI recipe (vanilla + ever
    /dumpjei myfolder     # writes to <gameDir>/jeidump/myfolder/
    ```
 4. The game may lag while it renders (should be unplayable for most people at default speed).
-5. To reduce the dump size (optimize for disk space at the cost of increased dump duration), you can enable background splitting in the config.
+5. Configure the export in the mod config if needed:
+   - `Capture Images`: disable this to skip recipe and ingredient PNG generation.
+   - `Export Format`: choose `html` for the bundled browser UI or `json` for data-only output.
+   - `Compact JSON Slots`: when exporting `json`, omit slot layout coordinates and drop list-backed slot entries that add no data beyond `inputs` and `outputs`.
+   - `Split Recipe Backgrounds`: optional disk-space optimization for image-enabled HTML dumps.
 
-When done, open `<gameDir>/jeidump/<folder>/index.html`.
+When done, open `<gameDir>/jeidump/<folder>/index.html` for `html` exports, or read the JSON files under `<gameDir>/jeidump/<folder>/data/` for `json` exports.
 
 ## Output layout
 
 ```
+html mode:
 index.html
 assets/style.css
 assets/app.js
@@ -26,6 +31,10 @@ data/manifest.json
 data/locales/<locale>/index.json
 data/locales/<locale>/categories/<sanitized_uid>/recipe_N.png
 data/locales/<locale>/ingredients/<kind>/<dedup_id>.png
+
+json mode:
+data/manifest.json
+data/locales/<locale>/index.json
 ```
 
 The frontend is dependency-free: no lunr, no React, no build step. The "fuzzy" search is a lowercase substring + subsequence scorer that handles tens of thousands of entries in the browser without trouble.

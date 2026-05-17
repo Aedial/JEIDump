@@ -5,10 +5,12 @@ import java.util.List;
 
 import net.minecraftforge.fml.common.Loader;
 
+import mezz.jei.api.ingredients.IIngredients;
 import mezz.jei.api.recipe.IRecipeCategory;
 import mezz.jei.api.recipe.IRecipeWrapper;
 
 import com.jeidump.integration.botania.BotaniaDumpRegistry;
+import com.jeidump.integration.enderiomachines.EnderIOMachinesDumpRegistry;
 import com.jeidump.integration.thermalexpansion.ThermalExpansionDumpRegistry;
 
 
@@ -28,9 +30,28 @@ public final class DumpIntegrations {
 
         integrations.add(new ConfiguredTooltipZoneIntegration());
         registerIfLoaded(integrations, new BotaniaDumpRegistry());
+        registerIfLoaded(integrations, new EnderIOMachinesDumpRegistry());
         registerIfLoaded(integrations, new ThermalExpansionDumpRegistry());
 
         return new DumpIntegrations(integrations);
+    }
+
+    public boolean maySkipRecipes(IRecipeCategory<?> category) {
+        for (RecipeDumpIntegration integration : integrations) {
+            if (integration.maySkipRecipe(category)) return true;
+        }
+
+        return false;
+    }
+
+    public boolean shouldSkipRecipe(IRecipeCategory<?> category, IRecipeWrapper wrapper,
+                                    IIngredients ingredients) {
+        for (RecipeDumpIntegration integration : integrations) {
+            if (!integration.maySkipRecipe(category)) continue;
+            if (integration.shouldSkipRecipe(category, wrapper, ingredients)) return true;
+        }
+
+        return false;
     }
 
     public List<RecipeDumpIntegration.Zone> collectZones(IRecipeCategory<?> category,
