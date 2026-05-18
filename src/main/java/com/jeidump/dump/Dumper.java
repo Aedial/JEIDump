@@ -17,6 +17,7 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -48,6 +49,7 @@ import mezz.jei.api.gui.IGuiIngredientGroup;
 import mezz.jei.api.gui.ITooltipCallback;
 import mezz.jei.api.gui.IRecipeLayoutDrawable;
 import mezz.jei.api.ingredients.IIngredientHelper;
+import mezz.jei.api.ingredients.IIngredients;
 import mezz.jei.api.ingredients.IIngredientRegistry;
 import mezz.jei.api.ingredients.IIngredientRenderer;
 import mezz.jei.api.ingredients.VanillaTypes;
@@ -55,6 +57,7 @@ import mezz.jei.api.recipe.IFocus;
 import mezz.jei.api.recipe.IIngredientType;
 import mezz.jei.api.recipe.IRecipeCategory;
 import mezz.jei.api.recipe.IRecipeWrapper;
+import mezz.jei.api.recipe.VanillaRecipeCategoryUid;
 
 import com.jeidump.JeiDump;
 import com.jeidump.command.CommandDumpJei;
@@ -82,9 +85,12 @@ import com.jeidump.i18n.JeiDumpLocales;
  *   index.html, assets/style.css, assets/app.js
  *   assets/lang/<locale>.lang, assets/lang/index.json, assets/lang/index.js
  *   data/manifest.json, data/manifest.js
- *   data/locales/<locale>/index.json
+ *   data/locales/<locale>/index.json, index.js
+ *   data/locales/<locale>/categories/<cat>/chunk_N.json, chunk_N.js (when chunking is enabled)
  *   data/locales/<locale>/categories/<cat>/background.png (when deduplication wins)
  *   data/locales/<locale>/categories/<cat>/recipe_N.png
+ *   data/locales/<locale>/resources/meta_<bucket>.json, meta_<bucket>.js (when chunking is enabled)
+ *   data/locales/<locale>/resources/refs_<bucket>.json, refs_<bucket>.js (when chunking is enabled)
  *   data/locales/<locale>/ingredients/<kind>/<id>.png
  * </pre>
  *
@@ -92,12 +98,14 @@ import com.jeidump.i18n.JeiDumpLocales;
  * <ul>
  *   <li>{@code img}: the full recipe PNG, or the per-recipe foreground layer when the category
  *       also exposes {@code backgroundImg}.</li>
- *   <li>{@code slots}: array of {@code {x,y,w,h,id,kind,role}} so the frontend can overlay
- *       hotspots that exactly match JEI's layout for hover/tooltip + click navigation. Slots may
- *       point at real JEI ingredients or synthetic recipe details such as Botania mana costs.
- *       Slots may also carry {@code tooltip}/{@code tooltipHtml} overrides when the live JEI
- *       tooltip for that stack differs from the shared ingredient metadata, for example fluids
- *       with different amounts.</li>
+ *   <li>{@code slots}: array of hotspot records. Standard JEI ingredient slots use
+ *       {@code {x,y,w,h,index}} where {@code index} points at {@code inputs}/{@code outputs}
+ *       with keys such as {@code in0} or {@code out2}; synthetic recipe details such as Botania
+ *       mana costs still use explicit {@code id}/{@code kind}/{@code role}. Slots may also carry
+ *       {@code tooltip}/{@code tooltipHtml} overrides when the live JEI tooltip for that stack
+ *       differs from the shared ingredient metadata, for example fluids with different amounts.
+ *       In compact JSON mode, layout coordinates are omitted and ingredient-backed slots that add
+ *       no extra tooltip data are dropped entirely.</li>
  * </ul>
  *
  * Per-category JSON may also include:
@@ -110,11 +118,11 @@ import com.jeidump.i18n.JeiDumpLocales;
  * <ul>
  *   <li>{@code nameHtml}: ingredient display name with Minecraft formatting codes converted to
  *       HTML spans for the frontend.</li>
- *   <li>{@code tooltip}: array of plain strings (slot-aware JEI NORMAL tooltip, color codes
- *       stripped),
- *       used for search keys and plain-text fallbacks.</li>
+ *   <li>{@code tooltip}: array of slot-aware JEI NORMAL tooltip lines. HTML exports strip color
+ *       codes here and pair them with {@code tooltipHtml}; JSON exports keep the original
+ *       Minecraft {@code §} formatting codes and omit {@code tooltipHtml}.</li>
  *   <li>{@code tooltipHtml}: array of tooltip lines with Minecraft formatting codes converted to
- *       HTML spans for the frontend.</li>
+ *       HTML spans for the frontend. Only written for HTML exports.</li>
  *   <li>{@code kind}: ingredient type key, so the frontend can label arbitrary JEI ingredient
  *       kinds without hardcoding item/fluid buckets. Synthetic recipe details can omit
  *       {@code img} when they do not have a standalone icon.</li>
@@ -124,6 +132,11 @@ import com.jeidump.i18n.JeiDumpLocales;
  * <ul>
  *   <li>{@code generatedAt}: ISO-8601 timestamp captured once when the dump starts, used by the
  *       website footer.</li>
+ *   <li>When chunking is enabled, {@code categories} becomes summary-only and recipe payloads
+ *       move into per-category chunk files that the frontend loads on demand.</li>
+ *   <li>When chunking is enabled, {@code ingredients} becomes compact search metadata only and
+ *       full tooltip payloads plus grouped recipe refs move into bucket files keyed by a
+ *       deterministic id hash.</li>
  * </ul>
  */
 public class Dumper {
@@ -168,8 +181,9 @@ public class Dumper {
         }
     }
 
-    /** Plain-text and HTML tooltip payload generated from the same JEI tooltip lines. */
+    /** Raw, plain-text, and HTML tooltip payload generated from the same JEI tooltip lines. */
     private static class TooltipText {
+        private final JsonArray raw = new JsonArray();
         private final JsonArray plain = new JsonArray();
         private final JsonArray html = new JsonArray();
     }
@@ -186,6 +200,12 @@ public class Dumper {
         }
     }
 
+    /** Aggregate counts for the two ingredient navigation modes shown by the frontend. */
+    private static class IngredientRefCounts {
+        private int recipes;
+        private int uses;
+    }
+
     /** Incremental category background split job. */
     private static class BackgroundSplitTask {
         private final JsonObject category;
@@ -200,6 +220,218 @@ public class Dumper {
         }
     }
 
+    /** Per-recipe refs that must continue pointing at the surviving card after merges. */
+    private static class RecipeRecord {
+        private final JsonObject recipe;
+        private final Map<String, String> inputRefs = new LinkedHashMap<>();
+        private final Map<String, String> outputRefs = new LinkedHashMap<>();
+        private final List<String> mergeSlotKeys = new ArrayList<>();
+
+        private RecipeRecord(JsonObject recipe) {
+            this.recipe = recipe;
+        }
+
+        private void addIndexedRef(String id, String role, String kind) {
+            if ("in".equals(role)) {
+                if (!inputRefs.containsKey(id)) inputRefs.put(id, kind);
+                return;
+            }
+
+            if (!"out".equals(role)) return;
+
+            if (!outputRefs.containsKey(id)) outputRefs.put(id, kind);
+        }
+
+        private void mergeFrom(RecipeRecord other) {
+            mergeRefs(inputRefs, other.inputRefs);
+            mergeRefs(outputRefs, other.outputRefs);
+        }
+
+        private static void mergeRefs(Map<String, String> target, Map<String, String> source) {
+            for (Map.Entry<String, String> entry : source.entrySet()) {
+                if (target.containsKey(entry.getKey())) continue;
+
+                target.put(entry.getKey(), entry.getValue());
+            }
+        }
+    }
+
+    /** Lightweight item-only capture of wrapper ingredients used for recipe filters and anvil dedupe. */
+    private static class CapturedIngredients implements IIngredients {
+        private List<List<ItemStack>> itemInputs = new ArrayList<>();
+        private List<List<ItemStack>> itemOutputs = new ArrayList<>();
+
+        @Override
+        public <T> void setInput(IIngredientType<T> ingredientType, T input) {
+            List<T> slot = new ArrayList<>();
+            slot.add(input);
+            setInputs(ingredientType, slot);
+        }
+
+        @Override
+        public <T> void setInputs(IIngredientType<T> ingredientType, List<T> input) {
+            List<List<T>> slots = new ArrayList<>();
+            for (T ingredient : input) {
+                List<T> slot = new ArrayList<>();
+                slot.add(ingredient);
+                slots.add(slot);
+            }
+
+            setInputLists(ingredientType, slots);
+        }
+
+        @Override
+        public <T> void setInputLists(IIngredientType<T> ingredientType, List<List<T>> inputs) {
+            if (ingredientType != VanillaTypes.ITEM) return;
+
+            itemInputs = copyItemSlots(inputs);
+        }
+
+        @Override
+        public <T> void setOutput(IIngredientType<T> ingredientType, T output) {
+            List<T> slot = new ArrayList<>();
+            slot.add(output);
+            setOutputs(ingredientType, slot);
+        }
+
+        @Override
+        public <T> void setOutputs(IIngredientType<T> ingredientType, List<T> outputs) {
+            List<List<T>> slots = new ArrayList<>();
+            for (T ingredient : outputs) {
+                List<T> slot = new ArrayList<>();
+                slot.add(ingredient);
+                slots.add(slot);
+            }
+
+            setOutputLists(ingredientType, slots);
+        }
+
+        @Override
+        public <T> void setOutputLists(IIngredientType<T> ingredientType, List<List<T>> outputs) {
+            if (ingredientType != VanillaTypes.ITEM) return;
+
+            itemOutputs = copyItemSlots(outputs);
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public <T> List<List<T>> getInputs(IIngredientType<T> ingredientType) {
+            if (ingredientType != VanillaTypes.ITEM) return Collections.emptyList();
+
+            return (List<List<T>>) (Object) itemInputs;
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public <T> List<List<T>> getOutputs(IIngredientType<T> ingredientType) {
+            if (ingredientType != VanillaTypes.ITEM) return Collections.emptyList();
+
+            return (List<List<T>>) (Object) itemOutputs;
+        }
+
+        @Override
+        @Deprecated
+        public <T> void setInput(Class<? extends T> ingredientClass, T input) {
+            if (ingredientClass != ItemStack.class) return;
+
+            setInput((IIngredientType<T>) VanillaTypes.ITEM, input);
+        }
+
+        @Override
+        @Deprecated
+        public <T> void setInputs(Class<? extends T> ingredientClass, List<T> input) {
+            if (ingredientClass != ItemStack.class) return;
+
+            setInputs((IIngredientType<T>) VanillaTypes.ITEM, input);
+        }
+
+        @Override
+        @Deprecated
+        public <T> void setInputLists(Class<? extends T> ingredientClass, List<List<T>> inputs) {
+            if (ingredientClass != ItemStack.class) return;
+
+            setInputLists((IIngredientType<T>) VanillaTypes.ITEM, inputs);
+        }
+
+        @Override
+        @Deprecated
+        public <T> void setOutput(Class<? extends T> ingredientClass, T output) {
+            if (ingredientClass != ItemStack.class) return;
+
+            setOutput((IIngredientType<T>) VanillaTypes.ITEM, output);
+        }
+
+        @Override
+        @Deprecated
+        public <T> void setOutputs(Class<? extends T> ingredientClass, List<T> outputs) {
+            if (ingredientClass != ItemStack.class) return;
+
+            setOutputs((IIngredientType<T>) VanillaTypes.ITEM, outputs);
+        }
+
+        @Override
+        @Deprecated
+        public <T> void setOutputLists(Class<? extends T> ingredientClass, List<List<T>> outputs) {
+            if (ingredientClass != ItemStack.class) return;
+
+            setOutputLists((IIngredientType<T>) VanillaTypes.ITEM, outputs);
+        }
+
+        @Override
+        @Deprecated
+        public <T> List<List<T>> getInputs(Class<? extends T> ingredientClass) {
+            if (ingredientClass != ItemStack.class) return Collections.emptyList();
+
+            return getInputs((IIngredientType<T>) VanillaTypes.ITEM);
+        }
+
+        @Override
+        @Deprecated
+        public <T> List<List<T>> getOutputs(Class<? extends T> ingredientClass) {
+            if (ingredientClass != ItemStack.class) return Collections.emptyList();
+
+            return getOutputs((IIngredientType<T>) VanillaTypes.ITEM);
+        }
+
+        private List<List<ItemStack>> getItemInputs() {
+            return itemInputs;
+        }
+
+        private List<List<ItemStack>> getItemOutputs() {
+            return itemOutputs;
+        }
+
+        private static <T> List<List<ItemStack>> copyItemSlots(List<List<T>> source) {
+            List<List<ItemStack>> copy = new ArrayList<>();
+            for (List<T> slot : source) {
+                List<ItemStack> copiedSlot = new ArrayList<>();
+                for (T value : slot) {
+                    if (!(value instanceof ItemStack)) continue;
+
+                    copiedSlot.add((ItemStack) value);
+                }
+
+                copy.add(copiedSlot);
+            }
+
+            return copy;
+        }
+    }
+
+    /** One rendered recipe card plus any skipped wrappers that should still point to it. */
+    private static class RecipeWorkItem {
+        private final IRecipeWrapper wrapper;
+        private final List<CapturedIngredients> mergedIngredients = new ArrayList<>();
+
+        private RecipeWorkItem(IRecipeWrapper wrapper) {
+            this.wrapper = wrapper;
+        }
+
+        private void addMergedIngredients(CapturedIngredients ingredients) {
+            mergedIngredients.add(ingredients);
+        }
+    }
+
     private enum WorkPhase {
         RECIPES,
         BACKGROUND_SPLIT,
@@ -211,6 +443,14 @@ public class Dumper {
         "assets/jeidump/web/style.css:assets/style.css",
         "assets/jeidump/web/app.js:assets/app.js"
     };
+
+    private static final String DATASET_REGISTRY = "__JEI_DUMP_DATASETS";
+    private static final String CATEGORY_CHUNK_REGISTRY = "__JEI_DUMP_CATEGORY_CHUNKS";
+    private static final String INGREDIENT_META_BUCKET_REGISTRY = "__JEI_DUMP_INGREDIENT_META_BUCKETS";
+    private static final String INGREDIENT_REF_BUCKET_REGISTRY = "__JEI_DUMP_INGREDIENT_REF_BUCKETS";
+    private static final int CATEGORY_CHUNK_SIZE = 1000;
+    private static final int INGREDIENT_BUCKET_HEX_DIGITS = 2;
+    private static final int INGREDIENT_BUCKET_COUNT = 1 << (INGREDIENT_BUCKET_HEX_DIGITS * 4);
 
     /**
      * Logical pixels of empty space added on every side of every recipe layout PNG. Some JEI
@@ -230,7 +470,14 @@ public class Dumper {
     private final DumpIntegrations integrations = DumpIntegrations.createDefault();
     private final String dumpLocale = JeiDumpLocales.getCurrentLocaleCode();
     private final String generatedAt = Instant.now().toString();
-    private final boolean splitRecipeBackgrounds = JeiDumpConfig.splitRecipeBackgrounds;
+    private final boolean captureImages = JeiDumpConfig.isImageCaptureEnabled();
+    private final JeiDumpConfig.ExportFormat exportFormat = JeiDumpConfig.getExportFormat();
+    private final boolean emitTooltipHtml = exportFormat == JeiDumpConfig.ExportFormat.HTML;
+    private final boolean preserveTooltipFormatting = exportFormat == JeiDumpConfig.ExportFormat.JSON;
+    private final boolean chunkDataFiles = JeiDumpConfig.isChunkDataFilesEnabled();
+    private final boolean compactJsonSlots = exportFormat == JeiDumpConfig.ExportFormat.JSON
+        && JeiDumpConfig.isCompactJsonSlotsEnabled();
+    private final boolean splitRecipeBackgrounds = captureImages && JeiDumpConfig.splitRecipeBackgrounds;
 
     /** Real and virtual ingredient metadata keyed by globally unique id. */
     private final Map<String, JsonObject> ingredientMeta = new LinkedHashMap<>();
@@ -275,19 +522,20 @@ public class Dumper {
     private static IFocus<ItemStack> fallbackFocus;
 
     // Phase state
-    private File dataDir, localesRoot, localeDataDir, catRoot, ingredientRoot;
+    private File dataDir, localesRoot, localeDataDir, catRoot, ingredientRoot, resourceRoot;
     @SuppressWarnings("rawtypes")
     private List<IRecipeCategory> categories;
     private int totalRecipes;
     private int catIdx;          // current category index
     private int wrapperIdx;      // current wrapper inside the active category
-    private List<IRecipeWrapper> currentWrappers;
+    private List<RecipeWorkItem> currentWorkItems;
     private IRecipeCategory<?> currentCategory;
     private String currentCatId;
     private File currentCatFolder;
     private int currentBgW, currentBgH;
     private JsonObject currentCatObj;
     private JsonArray currentRecipesJson;
+    private List<RecipeRecord> currentRecipeRecords;
     private final JsonArray categoriesJson = new JsonArray();
     private final List<BackgroundSplitTask> backgroundSplitTasks = new ArrayList<>();
 
@@ -295,6 +543,7 @@ public class Dumper {
     private WorkPhase workPhase = WorkPhase.RECIPES;
     private int backgroundSplitTaskIdx;
     private long dedupSavedBytes;
+    private int dedupSafetySkippedCategories;
 
     public Dumper(IJeiRuntime runtime, IIngredientRegistry ingredientRegistry, File outDir, ICommandSender sender) {
         this.runtime = runtime;
@@ -318,6 +567,7 @@ public class Dumper {
         localesRoot = new File(dataDir, "locales");
         localeDataDir = new File(localesRoot, dumpLocale);
         catRoot = new File(localeDataDir, "categories");
+        resourceRoot = new File(localeDataDir, "resources");
         ingredientRoot = new File(localeDataDir, "ingredients");
         if (!dataDir.mkdirs() && !dataDir.exists()) throw new IOException("Cannot create " + dataDir);
         if (!localesRoot.mkdirs() && !localesRoot.exists()) throw new IOException("Cannot create " + localesRoot);
@@ -326,15 +576,16 @@ public class Dumper {
         }
         if (!localeDataDir.mkdirs() && !localeDataDir.exists()) throw new IOException("Cannot create " + localeDataDir);
         catRoot.mkdirs();
+        resourceRoot.mkdirs();
         ingredientRoot.mkdirs();
-        new File(outDir, "assets").mkdirs();
+        if (writesHtmlShell()) new File(outDir, "assets").mkdirs();
 
         IRecipeRegistry rr = runtime.getRecipeRegistry();
         categories = rr.getRecipeCategories();
         result.categoryCount = categories.size();
 
         for (IRecipeCategory cat : categories) {
-            totalRecipes += rr.getRecipeWrappers(cat).size();
+            totalRecipes += buildRecipeWorkItems(cat, rr.getRecipeWrappers(cat)).size();
         }
         CommandDumpJei.info(sender, "jeidump.command.scan_total", totalRecipes, categories.size());
 
@@ -383,7 +634,7 @@ public class Dumper {
 
         while (processed < budget) {
             // Skip empty categories or advance past the end of the current one.
-            while (currentCategory != null && wrapperIdx >= currentWrappers.size()) {
+            while (currentCategory != null && wrapperIdx >= currentWorkItems.size()) {
                 finalizeCurrentCategory();
                 catIdx++;
                 wrapperIdx = 0;
@@ -394,12 +645,15 @@ public class Dumper {
             }
             if (currentCategory == null) return false;
 
-            IRecipeWrapper wrapper = currentWrappers.get(wrapperIdx);
+            RecipeWorkItem workItem = currentWorkItems.get(wrapperIdx);
+            IRecipeWrapper wrapper = workItem.wrapper;
             try {
                 IRecipeLayoutDrawable layout = createLayoutWithRetry(rr, currentCategory, wrapper);
                 if (layout != null) {
-                    File pngFile = new File(currentCatFolder, "recipe_" + wrapperIdx + ".png");
-                    renderer.renderRecipeLayout(layout, currentBgW, currentBgH, RECIPE_PADDING, pngFile);
+                    if (captureImages) {
+                        File pngFile = new File(currentCatFolder, "recipe_" + wrapperIdx + ".png");
+                        renderer.renderRecipeLayout(layout, currentBgW, currentBgH, RECIPE_PADDING, pngFile);
+                    }
 
                     // Logical canvas size including the padding band. The PNG file itself is this
                     // size multiplied by IconRenderer.RECIPE_SCALE, but the frontend works in
@@ -410,7 +664,9 @@ public class Dumper {
                     JsonObject recObj = new JsonObject();
                     // During the final deduplication pass this file may be rewritten in place as
                     // a foreground-only layer if the shared background split is smaller on disk.
-                    recObj.addProperty("img", localeDataPath("categories/" + currentCatId + "/recipe_" + wrapperIdx + ".png"));
+                    if (captureImages) {
+                        recObj.addProperty("img", localeDataPath("categories/" + currentCatId + "/recipe_" + wrapperIdx + ".png"));
+                    }
                     recObj.addProperty("w", canvasW);
                     recObj.addProperty("h", canvasH);
                     // Pixel multiplier baked into the PNG. The frontend uses this to display the
@@ -421,14 +677,17 @@ public class Dumper {
                     JsonArray inputs = new JsonArray();
                     JsonArray outputs = new JsonArray();
                     JsonArray slots = new JsonArray();
+                    RecipeRecord recipeRecord = new RecipeRecord(recObj);
 
-                    collectIngredientSlots(layout, currentCatId, wrapperIdx, inputs, outputs, slots);
-                    collectInternalIngredientHotspots(currentCategory, wrapper, currentCatId, wrapperIdx, slots);
+                    collectIngredientSlots(layout, currentCatId, wrapperIdx, inputs, outputs, slots, recipeRecord);
+                    collectInternalIngredientHotspots(currentCategory, wrapper, currentCatId, wrapperIdx, slots, recipeRecord);
+                    collectMergedIngredientRefs(currentCatId, wrapperIdx, recipeRecord, workItem);
 
                     recObj.add("inputs", inputs);
                     recObj.add("outputs", outputs);
                     recObj.add("slots", slots);
                     currentRecipesJson.add(recObj);
+                    currentRecipeRecords.add(recipeRecord);
                 }
             } catch (Throwable t) {
                 JeiDump.LOGGER.warn("Skipping recipe #{} of category {}: {}", wrapperIdx, currentCategory.getUid(), t.toString());
@@ -452,25 +711,36 @@ public class Dumper {
     /** Write locale-aware dump data + copy bundled web assets. Call after {@link #step(int, int)} returns false. */
     public Result finish() throws IOException {
         flushRecipePhase();
+        result.recipeCount = countFinalRecipeCards();
 
         JsonObject root = buildDataRoot();
         writeJson(root, new File(localeDataDir, "index.json"));
-        writeLocaleDataScript(root, new File(localeDataDir, "index.js"), dumpLocale);
+        if (chunkDataFiles) {
+            writeCategoryChunks();
+            writeIngredientMetaBuckets();
+            writeIngredientRefBuckets();
+        }
 
         writeDataManifest();
-        writeLangBundle();
 
-        for (String pair : RESOURCE_FILES) {
-            int colon = pair.indexOf(':');
-            String src = pair.substring(0, colon);
-            File dst = new File(outDir, pair.substring(colon + 1));
-            copyResource(src, dst);
+        if (writesHtmlShell()) {
+            writeLocaleDataScript(root, new File(localeDataDir, "index.js"), dumpLocale);
+            writeLangBundle();
+
+            for (String pair : RESOURCE_FILES) {
+                int colon = pair.indexOf(':');
+                String src = pair.substring(0, colon);
+                File dst = new File(outDir, pair.substring(colon + 1));
+                copyResource(src, dst);
+            }
         }
 
         result.iconCount = countRenderedIngredientIcons();
 
         long finalDumpBytes = measureTreeBytes(outDir.toPath());
-        if (!splitRecipeBackgrounds) {
+        if (!captureImages) {
+            CommandDumpJei.info(sender, "jeidump.command.images.disabled");
+        } else if (!splitRecipeBackgrounds) {
             CommandDumpJei.info(sender, "jeidump.command.dedup.disabled");
         } else if (dedupSavedBytes > 0L) {
             long originalDumpBytes = finalDumpBytes + dedupSavedBytes;
@@ -482,13 +752,327 @@ public class Dumper {
             CommandDumpJei.info(sender, "jeidump.command.dedup.none");
         }
 
+        if (dedupSafetySkippedCategories > 0) {
+            JeiDump.LOGGER.warn(
+                "Skipped background splitting for {} categories because they exceeded the in-memory safety budget",
+                dedupSafetySkippedCategories
+            );
+        }
+
         return result;
     }
 
     private void flushRecipePhase() {
-        if (currentCategory == null || wrapperIdx < currentWrappers.size()) return;
+        if (currentCategory == null || wrapperIdx < currentWorkItems.size()) return;
 
         finalizeCurrentCategory();
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private List<RecipeWorkItem> buildRecipeWorkItems(IRecipeCategory<?> category, List<IRecipeWrapper> wrappers) {
+        List<RecipeWorkItem> workItems = new ArrayList<>();
+        boolean anvilCategory = VanillaRecipeCategoryUid.ANVIL.equals(category.getUid());
+        boolean integrationFilters = integrations.maySkipRecipes(category);
+        if (!anvilCategory && !integrationFilters) {
+            for (IRecipeWrapper wrapper : wrappers) workItems.add(new RecipeWorkItem(wrapper));
+
+            return workItems;
+        }
+
+        Map<String, RecipeWorkItem> byMergeKey = new LinkedHashMap<>();
+        for (IRecipeWrapper wrapper : wrappers) {
+            CapturedIngredients ingredients = captureIngredients(wrapper);
+            if (integrationFilters && integrations.shouldSkipRecipe(category, wrapper, ingredients)) continue;
+
+            if (!anvilCategory) {
+                workItems.add(new RecipeWorkItem(wrapper));
+                continue;
+            }
+
+            if (shouldSkipAnvilRepairRecipe(ingredients)) continue;
+
+            String mergeKey = buildCapturedAnvilMergeKey(ingredients);
+            if (mergeKey == null) {
+                workItems.add(new RecipeWorkItem(wrapper));
+                continue;
+            }
+
+            RecipeWorkItem existing = byMergeKey.get(mergeKey);
+            if (existing == null) {
+                RecipeWorkItem created = new RecipeWorkItem(wrapper);
+                byMergeKey.put(mergeKey, created);
+                workItems.add(created);
+                continue;
+            }
+
+            existing.addMergedIngredients(ingredients);
+        }
+
+        return workItems;
+    }
+
+    private static CapturedIngredients captureIngredients(IRecipeWrapper wrapper) {
+        CapturedIngredients ingredients = new CapturedIngredients();
+        wrapper.getIngredients(ingredients);
+        return ingredients;
+    }
+
+    /**
+     * Skip pure item-plus-same-item anvil repairs before dedupe so the dump keeps only
+     * transformational anvil recipes instead of tens of thousands of durability permutations.
+     */
+    private static boolean shouldSkipAnvilRepairRecipe(CapturedIngredients ingredients) {
+        List<ItemStack> inputs = collectPrimaryItemStacks(ingredients.getItemInputs());
+        List<ItemStack> outputs = collectPrimaryItemStacks(ingredients.getItemOutputs());
+        if (inputs.size() != 2 || outputs.size() != 1) return false;
+
+        ItemStack left = inputs.get(0);
+        ItemStack right = inputs.get(1);
+        ItemStack output = outputs.get(0);
+        if (!isRepairableStack(left) || !isRepairableStack(right) || !isRepairableStack(output)) {
+            return false;
+        }
+
+        if (!isSameRepairRecipeItem(left, right)) return false;
+
+        return isSameRepairRecipeItem(left, output);
+    }
+
+    private static List<ItemStack> collectPrimaryItemStacks(List<List<ItemStack>> slots) {
+        List<ItemStack> primaryStacks = new ArrayList<>();
+        for (List<ItemStack> slot : slots) {
+            ItemStack primary = firstPresentItemStack(slot);
+            if (primary == null) continue;
+
+            primaryStacks.add(primary);
+        }
+
+        return primaryStacks;
+    }
+
+    @Nullable
+    private static ItemStack firstPresentItemStack(List<ItemStack> slot) {
+        for (ItemStack stack : slot) {
+            if (stack == null || stack.isEmpty()) continue;
+
+            return stack;
+        }
+
+        return null;
+    }
+
+    private static boolean isRepairableStack(ItemStack stack) {
+        return !stack.isEmpty() && stack.isItemStackDamageable();
+    }
+
+    /**
+     * Repair wrappers vary by damage and sometimes NBT, but they still collapse to the same
+     * user-facing recipe family once the underlying damageable item matches.
+     */
+    private static boolean isSameRepairRecipeItem(ItemStack left, ItemStack right) {
+        return !left.isEmpty() && !right.isEmpty() && left.getItem() == right.getItem();
+    }
+
+    @Nullable
+    private String buildCapturedAnvilMergeKey(CapturedIngredients ingredients) {
+        IngredientTypeState<ItemStack> state = stateForType(VanillaTypes.ITEM);
+        List<String> slotKeys = new ArrayList<>();
+
+        addCapturedSlotMergeKeys(slotKeys, state, "in", ingredients.getItemInputs());
+        addCapturedSlotMergeKeys(slotKeys, state, "out", ingredients.getItemOutputs());
+        if (slotKeys.isEmpty()) return null;
+
+        StringBuilder key = new StringBuilder();
+        for (String slotKey : slotKeys) {
+            if (key.length() > 0) key.append("\n\n");
+
+            key.append(slotKey);
+        }
+
+        return key.toString();
+    }
+
+    private static void addCapturedSlotMergeKeys(List<String> out, IngredientTypeState<ItemStack> state,
+                                                 String role, List<List<ItemStack>> slots) {
+        for (int slotIndex = 0; slotIndex < slots.size(); slotIndex++) {
+            ItemStack primary = firstNonNull(expandIngredients(state, slots.get(slotIndex)));
+            if (!isRenderableIngredient(state, primary)) continue;
+
+            StringBuilder key = new StringBuilder();
+            key.append(role).append('\n');
+            key.append(slotIndex).append('\n');
+            key.append(normalizeRecipeSlotItemStack(primary));
+            out.add(key.toString());
+        }
+    }
+
+    private void collectMergedIngredientRefs(String catId, int recipeIdx, RecipeRecord recipeRecord,
+                                             RecipeWorkItem workItem) throws IOException {
+        if (workItem.mergedIngredients.isEmpty()) return;
+
+        IngredientTypeState<ItemStack> state = stateForType(VanillaTypes.ITEM);
+        for (CapturedIngredients ingredients : workItem.mergedIngredients) {
+            collectCapturedItemRefs(state, ingredients.getItemInputs(), "in", catId, recipeIdx, recipeRecord);
+            collectCapturedItemRefs(state, ingredients.getItemOutputs(), "out", catId, recipeIdx, recipeRecord);
+        }
+    }
+
+    private void collectCapturedItemRefs(IngredientTypeState<ItemStack> state, List<List<ItemStack>> slots,
+                                         String role, String catId, int recipeIdx,
+                                         RecipeRecord recipeRecord) throws IOException {
+        for (List<ItemStack> slotValues : slots) {
+            Set<String> indexedIds = new LinkedHashSet<>();
+            for (ItemStack value : expandIngredients(state, slotValues)) {
+                indexedIds.add(registerIngredient(state, value, null));
+            }
+
+            if (indexedIds.isEmpty()) continue;
+
+            for (String id : indexedIds) {
+                addInverted(id, catId, recipeIdx, role, state.kind);
+                recipeRecord.addIndexedRef(id, role, state.kind);
+            }
+        }
+    }
+
+    /**
+     * Merge anvil cards when every visible slot only differs by item damage, keeping the first
+     * rendered PNG as the representative card and repointing all ingredient refs to it.
+     */
+    private void mergeCurrentAnvilRecipes() {
+        if (currentRecipeRecords == null || currentRecipeRecords.size() < 2) return;
+
+        Map<String, RecipeRecord> mergedByKey = new LinkedHashMap<>();
+        List<RecipeRecord> mergedRecords = new ArrayList<>();
+        List<RecipeRecord> removedRecords = new ArrayList<>();
+
+        for (RecipeRecord recipeRecord : currentRecipeRecords) {
+            String mergeKey = buildAnvilRecipeMergeKey(recipeRecord);
+            if (mergeKey == null) {
+                mergedRecords.add(recipeRecord);
+                continue;
+            }
+
+            RecipeRecord merged = mergedByKey.get(mergeKey);
+            if (merged == null) {
+                mergedByKey.put(mergeKey, recipeRecord);
+                mergedRecords.add(recipeRecord);
+                continue;
+            }
+
+            merged.mergeFrom(recipeRecord);
+            removedRecords.add(recipeRecord);
+        }
+
+        if (removedRecords.isEmpty()) return;
+
+        removeCategoryIngredientRefs(currentCatId, currentRecipeRecords);
+        deleteRecipeImages(removedRecords);
+
+        currentRecipeRecords = mergedRecords;
+        currentRecipesJson = new JsonArray();
+        for (RecipeRecord recipeRecord : currentRecipeRecords) {
+            currentRecipesJson.add(recipeRecord.recipe);
+        }
+
+        addCategoryIngredientRefs(currentCatId, currentRecipeRecords);
+    }
+
+    @Nullable
+    private static String buildAnvilRecipeMergeKey(RecipeRecord recipeRecord) {
+        if (recipeRecord.mergeSlotKeys.isEmpty()) return null;
+
+        StringBuilder key = new StringBuilder();
+        for (String slotKey : recipeRecord.mergeSlotKeys) {
+            if (key.length() > 0) key.append("\n\n");
+
+            key.append(slotKey);
+        }
+
+        return key.toString();
+    }
+
+    private void removeCategoryIngredientRefs(String catId, List<RecipeRecord> recipeRecords) {
+        Set<String> ingredientIds = new LinkedHashSet<>();
+        for (RecipeRecord recipeRecord : recipeRecords) {
+            ingredientIds.addAll(recipeRecord.inputRefs.keySet());
+            ingredientIds.addAll(recipeRecord.outputRefs.keySet());
+        }
+
+        String refPrefix = catId + '\n';
+        for (String ingredientId : ingredientIds) {
+            JsonArray refs = ingredientRecipes.get(ingredientId);
+            if (refs != null) {
+                JsonArray filtered = new JsonArray();
+                for (JsonElement refElement : refs) {
+                    JsonObject ref = refElement.getAsJsonObject();
+                    if (catId.equals(ref.get("cat").getAsString())) continue;
+
+                    filtered.add(ref);
+                }
+
+                if (filtered.size() == 0) {
+                    ingredientRecipes.remove(ingredientId);
+                } else {
+                    ingredientRecipes.put(ingredientId, filtered);
+                }
+            }
+
+            Set<String> seenKeys = ingredientRecipeKeys.get(ingredientId);
+            if (seenKeys == null) continue;
+
+            Set<String> filteredKeys = new LinkedHashSet<>();
+            for (String seenKey : seenKeys) {
+                if (seenKey.startsWith(refPrefix)) continue;
+
+                filteredKeys.add(seenKey);
+            }
+
+            if (filteredKeys.isEmpty()) {
+                ingredientRecipeKeys.remove(ingredientId);
+            } else {
+                ingredientRecipeKeys.put(ingredientId, filteredKeys);
+            }
+        }
+    }
+
+    private void addCategoryIngredientRefs(String catId, List<RecipeRecord> recipeRecords) {
+        for (int recipeIdx = 0; recipeIdx < recipeRecords.size(); recipeIdx++) {
+            RecipeRecord recipeRecord = recipeRecords.get(recipeIdx);
+            for (Map.Entry<String, String> entry : recipeRecord.inputRefs.entrySet()) {
+                addInverted(entry.getKey(), catId, recipeIdx, "in", entry.getValue());
+            }
+
+            for (Map.Entry<String, String> entry : recipeRecord.outputRefs.entrySet()) {
+                addInverted(entry.getKey(), catId, recipeIdx, "out", entry.getValue());
+            }
+        }
+    }
+
+    private void deleteRecipeImages(List<RecipeRecord> removedRecords) {
+        for (RecipeRecord recipeRecord : removedRecords) {
+            JsonElement imgElement = recipeRecord.recipe.get("img");
+            if (imgElement == null) continue;
+
+            Path imgPath = new File(outDir, imgElement.getAsString()).toPath();
+            try {
+                Files.deleteIfExists(imgPath);
+            } catch (IOException e) {
+                JeiDump.LOGGER.warn("Failed to delete merged recipe image {}: {}", imgPath, e.toString());
+            }
+        }
+    }
+
+    private int countFinalRecipeCards() {
+        int count = 0;
+        for (JsonElement categoryElement : categoriesJson) {
+            JsonArray recipes = categoryElement.getAsJsonObject().getAsJsonArray("recipes");
+            if (recipes == null) continue;
+
+            count += recipes.size();
+        }
+
+        return count;
     }
 
     // ----- per-category bookkeeping -----
@@ -513,12 +1097,17 @@ public class Dumper {
         currentCatObj.addProperty("title", cat.getTitle());
         currentCatObj.addProperty("modName", cat.getModName());
         currentRecipesJson = new JsonArray();
+        currentRecipeRecords = new ArrayList<>();
 
-        currentWrappers = (List) runtime.getRecipeRegistry().getRecipeWrappers((IRecipeCategory) cat);
+        currentWorkItems = buildRecipeWorkItems(cat, runtime.getRecipeRegistry().getRecipeWrappers((IRecipeCategory) cat));
     }
 
     private void finalizeCurrentCategory() {
         if (currentCategory == null) return;
+
+        if (VanillaRecipeCategoryUid.ANVIL.equals(currentCategory.getUid())) {
+            mergeCurrentAnvilRecipes();
+        }
 
         currentCatObj.addProperty("recipeCount", currentRecipesJson.size());
         currentCatObj.add("recipes", currentRecipesJson);
@@ -529,9 +1118,10 @@ public class Dumper {
     // ----- ingredient collection -----
 
     private void collectIngredientSlots(IRecipeLayoutDrawable layout, String catId, int recipeIdx,
-                                        JsonArray inputs, JsonArray outputs, JsonArray slots) throws IOException {
+                                        JsonArray inputs, JsonArray outputs, JsonArray slots,
+                                        RecipeRecord recipeRecord) throws IOException {
         for (IngredientGroupAccess<?> access : getIngredientGroups(layout)) {
-            collectIngredientGroupSlots(access, catId, recipeIdx, inputs, outputs, slots);
+            collectIngredientGroupSlots(access, catId, recipeIdx, inputs, outputs, slots, recipeRecord);
         }
     }
 
@@ -540,7 +1130,8 @@ public class Dumper {
      * hotspots, so the website can search and navigate them like normal ingredients.
      */
     private void collectInternalIngredientHotspots(IRecipeCategory<?> category, IRecipeWrapper wrapper,
-                                                   String catId, int recipeIdx, JsonArray slots)
+                                                   String catId, int recipeIdx, JsonArray slots,
+                                                   RecipeRecord recipeRecord)
         throws ReflectiveOperationException {
         for (RecipeDumpIntegration.Zone zone : integrations.collectZones(category, wrapper)) {
             String ingredientId = null;
@@ -554,7 +1145,12 @@ public class Dumper {
 
                 if (zone.role != null) {
                     addInverted(ingredientId, catId, recipeIdx, zone.role, kind);
+                    recipeRecord.addIndexedRef(ingredientId, zone.role, kind);
                 }
+            }
+
+            if (ingredientId != null && kind != null && zone.role != null) {
+                recipeRecord.mergeSlotKeys.add(buildExtraZoneMergeSlotKey(zone, ingredientId, kind));
             }
 
             addExtraZone(slots, zone, ingredientId, kind, tooltipOverride);
@@ -587,20 +1183,24 @@ public class Dumper {
 
     @SuppressWarnings("unchecked")
     private void collectIngredientGroupSlots(IngredientGroupAccess<?> access, String catId, int recipeIdx,
-                                             JsonArray inputs, JsonArray outputs, JsonArray slots) throws IOException {
-        collectIngredientGroupSlotsTyped((IngredientGroupAccess<Object>) access, catId, recipeIdx, inputs, outputs, slots);
+                                             JsonArray inputs, JsonArray outputs, JsonArray slots,
+                                             RecipeRecord recipeRecord) throws IOException {
+        collectIngredientGroupSlotsTyped((IngredientGroupAccess<Object>) access, catId, recipeIdx, inputs, outputs, slots, recipeRecord);
     }
 
     private <T> void collectIngredientGroupSlotsTyped(IngredientGroupAccess<T> access, String catId, int recipeIdx,
-                                                      JsonArray inputs, JsonArray outputs, JsonArray slots) throws IOException {
+                                                      JsonArray inputs, JsonArray outputs, JsonArray slots,
+                                                      RecipeRecord recipeRecord) throws IOException {
         IngredientTypeState<T> state = stateForType(access.type);
         for (IGuiIngredient<T> ingredient : access.group.getGuiIngredients().values()) {
             T primary = firstRenderableIngredient(state, ingredient);
             if (primary == null) continue;
 
             String primaryId = registerIngredient(state, primary, ingredient);
-            (ingredient.isInput() ? inputs : outputs).add(new JsonPrimitive(primaryId));
-            addSlot(slots, ingredient, primaryId, state.kind, RECIPE_PADDING,
+            recipeRecord.mergeSlotKeys.add(buildRecipeMergeSlotKey(state, ingredient, primary));
+            JsonArray recipeIngredients = ingredient.isInput() ? inputs : outputs;
+            recipeIngredients.add(new JsonPrimitive(primaryId));
+            addSlot(slots, ingredient, buildSlotIndex(ingredient.isInput(), recipeIngredients.size() - 1), RECIPE_PADDING,
                 buildSlotTooltipOverride(primaryId, buildIngredientTooltip(state, ingredient, primary)));
 
             Set<String> indexedIds = new LinkedHashSet<>();
@@ -614,6 +1214,7 @@ public class Dumper {
             String role = ingredient.isInput() ? "in" : "out";
             for (String id : indexedIds) {
                 addInverted(id, catId, recipeIdx, role, state.kind);
+                recipeRecord.addIndexedRef(id, role, state.kind);
             }
         }
     }
@@ -719,7 +1320,9 @@ public class Dumper {
         }
 
         String fileStem = fileStemFor(id);
-        renderer.renderIngredientIcon(state.renderer, ingredient, new File(state.rootDir, fileStem + ".png"));
+        if (captureImages) {
+            renderer.renderIngredientIcon(state.renderer, ingredient, new File(state.rootDir, fileStem + ".png"));
+        }
 
         String displayName = safeDisplayName(state, ingredient);
         TooltipText tooltip = buildIngredientTooltip(state, guiIngredient, ingredient);
@@ -728,10 +1331,11 @@ public class Dumper {
         meta.addProperty("name", stripFormatting(displayName));
         meta.addProperty("nameHtml", formatMinecraftTextToHtml(displayName));
         meta.addProperty("mod", safeModId(state, ingredient));
-        meta.addProperty("img", localeDataPath("ingredients/" + state.kind + "/" + fileStem + ".png"));
+        if (captureImages) {
+            meta.addProperty("img", localeDataPath("ingredients/" + state.kind + "/" + fileStem + ".png"));
+        }
         meta.addProperty("kind", state.kind);
-        meta.add("tooltip", tooltip.plain);
-        meta.add("tooltipHtml", tooltip.html);
+        addSerializedTooltip(meta, tooltip);
         ingredientMeta.put(id, meta);
         state.uniqueCount++;
         return id;
@@ -820,6 +1424,7 @@ public class Dumper {
 
     private static void addTooltipLines(TooltipText tooltip, List<String> lines) {
         for (String line : lines) {
+            tooltip.raw.add(new JsonPrimitive(line));
             tooltip.plain.add(new JsonPrimitive(stripFormatting(line)));
             tooltip.html.add(new JsonPrimitive(formatMinecraftTextToHtml(line)));
         }
@@ -837,12 +1442,15 @@ public class Dumper {
     private TooltipText buildSlotTooltipOverride(String ingredientId, TooltipText slotTooltip) {
         JsonObject meta = ingredientMeta.get(ingredientId);
         if (meta == null) return slotTooltip;
-        if (jsonArraysEqual(meta.getAsJsonArray("tooltip"), slotTooltip.plain)
-            && jsonArraysEqual(meta.getAsJsonArray("tooltipHtml"), slotTooltip.html)) {
-            return null;
+        if (!jsonArraysEqual(meta.getAsJsonArray("tooltip"), serializeTooltip(slotTooltip))) {
+            return slotTooltip;
         }
 
-        return slotTooltip;
+        if (emitTooltipHtml && !jsonArraysEqual(meta.getAsJsonArray("tooltipHtml"), slotTooltip.html)) {
+            return slotTooltip;
+        }
+
+        return null;
     }
 
     private static boolean jsonArraysEqual(@Nullable JsonArray left, @Nullable JsonArray right) {
@@ -878,6 +1486,7 @@ public class Dumper {
 
         if (tooltip.plain.size() == 0) {
             String displayName = safeDisplayName(state, ingredient);
+            tooltip.raw.add(new JsonPrimitive(displayName));
             tooltip.plain.add(new JsonPrimitive(stripFormatting(displayName)));
             tooltip.html.add(new JsonPrimitive(formatMinecraftTextToHtml(displayName)));
         }
@@ -1088,6 +1697,15 @@ public class Dumper {
         return id;
     }
 
+    private JsonArray serializeTooltip(TooltipText tooltip) {
+        return preserveTooltipFormatting ? tooltip.raw : tooltip.plain;
+    }
+
+    private void addSerializedTooltip(JsonObject target, TooltipText tooltip) {
+        target.add("tooltip", serializeTooltip(tooltip));
+        if (emitTooltipHtml) target.add("tooltipHtml", tooltip.html);
+    }
+
     private void addInverted(String id, String catId, int recipeIdx, String role, String kind) {
         String refKey = catId + '\n' + recipeIdx + '\n' + role;
         Set<String> seenKeys = ingredientRecipeKeys.get(id);
@@ -1138,51 +1756,96 @@ public class Dumper {
     }
 
     /**
-     * Append a slot rect to the per-recipe slots array, if we can read the rect via reflection.
-     * The rect is shifted by {@code padding} on both axes because the recipe layout is drawn at
-     * {@code (padding, padding)} on the padded canvas; without the offset the frontend hotspots
-     * would land in the empty band on the top-left of the image.
+     * Append a slot record to the per-recipe slots array. Standard JEI ingredient slots point at
+     * the recipe's inputs/outputs through {@code index}; synthetic zones keep explicit
+     * ingredient ids.
      */
-    private static void addSlot(JsonArray slots, IGuiIngredient<?> ig, String id, String kind, int padding,
-                                @Nullable TooltipText tooltipOverride) {
+    private void addSlot(JsonArray slots, IGuiIngredient<?> ig, String index, int padding,
+                         @Nullable TooltipText tooltipOverride) {
         Rectangle r = readRect(ig);
-        if (r == null) return;
+        if (!compactJsonSlots && r == null) return;
+
         JsonObject slot = new JsonObject();
-        slot.addProperty("x", r.x + padding);
-        slot.addProperty("y", r.y + padding);
-        slot.addProperty("w", r.width);
-        slot.addProperty("h", r.height);
-        slot.addProperty("id", id);
-        slot.addProperty("kind", kind);
-        slot.addProperty("role", ig.isInput() ? "in" : "out");
-        if (tooltipOverride != null) {
-            slot.add("tooltip", tooltipOverride.plain);
-            slot.add("tooltipHtml", tooltipOverride.html);
+        if (!compactJsonSlots && r != null) {
+            slot.addProperty("x", r.x + padding);
+            slot.addProperty("y", r.y + padding);
+            slot.addProperty("w", r.width);
+            slot.addProperty("h", r.height);
         }
+        slot.addProperty("index", index);
+        if (tooltipOverride != null) addSerializedTooltip(slot, tooltipOverride);
+
+        if (compactJsonSlots && isRedundantIndexedSlot(slot)) return;
+
         slots.add(slot);
     }
 
-    private static void addExtraZone(JsonArray slots, RecipeDumpIntegration.Zone zone, @Nullable String id,
-                                     @Nullable String kind, @Nullable TooltipText tooltipOverride) {
+    private void addExtraZone(JsonArray slots, RecipeDumpIntegration.Zone zone, @Nullable String id,
+                              @Nullable String kind, @Nullable TooltipText tooltipOverride) {
         JsonObject slot = new JsonObject();
-        slot.addProperty("x", zone.x + RECIPE_PADDING);
-        slot.addProperty("y", zone.y + RECIPE_PADDING);
-        slot.addProperty("w", zone.width);
-        slot.addProperty("h", zone.height);
-        if (id != null) {
-            slot.addProperty("id", id);
+        if (!compactJsonSlots) {
+            slot.addProperty("x", zone.x + RECIPE_PADDING);
+            slot.addProperty("y", zone.y + RECIPE_PADDING);
+            slot.addProperty("w", zone.width);
+            slot.addProperty("h", zone.height);
         }
-        if (kind != null) {
-            slot.addProperty("kind", kind);
-        }
-        if (zone.role != null) {
-            slot.addProperty("role", zone.role);
-        }
-        if (tooltipOverride != null) {
-            slot.add("tooltip", tooltipOverride.plain);
-            slot.add("tooltipHtml", tooltipOverride.html);
-        }
+        if (id != null) slot.addProperty("id", id);
+        if (kind != null) slot.addProperty("kind", kind);
+        if (zone.role != null) slot.addProperty("role", zone.role);
+        if (tooltipOverride != null) addSerializedTooltip(slot, tooltipOverride);
+
+        if (slot.entrySet().isEmpty()) return;
+
         slots.add(slot);
+    }
+
+    private static String buildSlotIndex(boolean input, int index) {
+        return (input ? "in" : "out") + index;
+    }
+
+    private static boolean isRedundantIndexedSlot(JsonObject slot) {
+        return slot.entrySet().size() == 1 && slot.has("index");
+    }
+
+    private static <T> String buildRecipeMergeSlotKey(IngredientTypeState<T> state, IGuiIngredient<T> ingredient, T primary) {
+        StringBuilder key = new StringBuilder();
+        key.append(ingredient.isInput() ? "in" : "out").append('\n');
+        key.append(state.kind).append('\n');
+
+        Rectangle rect = readRect(ingredient);
+        if (rect != null) {
+            key.append(rect.x).append(',').append(rect.y).append(',').append(rect.width).append(',').append(rect.height);
+        }
+        key.append('\n').append(normalizeRecipeSlotIngredientKey(state, primary));
+        return key.toString();
+    }
+
+    private static String buildExtraZoneMergeSlotKey(RecipeDumpIntegration.Zone zone, String id, String kind) {
+        StringBuilder key = new StringBuilder();
+        key.append(zone.role).append('\n');
+        key.append(kind).append('\n');
+        key.append(zone.x).append(',').append(zone.y).append(',').append(zone.width).append(',').append(zone.height);
+        key.append('\n').append(id);
+        return key.toString();
+    }
+
+    private static <T> String normalizeRecipeSlotIngredientKey(IngredientTypeState<T> state, T ingredient) {
+        if (state.type == VanillaTypes.ITEM && ingredient instanceof ItemStack) {
+            return normalizeRecipeSlotItemStack((ItemStack) ingredient);
+        }
+
+        return state.kind + ':' + safeUniqueId(state, ingredient);
+    }
+
+    private static String normalizeRecipeSlotItemStack(ItemStack stack) {
+        StringBuilder key = new StringBuilder();
+        key.append(String.valueOf(stack.getItem().getRegistryName())).append('\n');
+        key.append(stack.getCount()).append('\n');
+
+        if (!stack.isItemStackDamageable()) key.append(stack.getMetadata());
+        if (stack.hasTagCompound()) key.append('\n').append(stack.getTagCompound());
+
+        return key.toString();
     }
 
     @Nullable
@@ -1262,9 +1925,64 @@ public class Dumper {
     }
 
     private JsonObject buildDataRoot() {
+        if (!chunkDataFiles) return buildMonolithicDataRoot();
+
+        return buildChunkedDataRoot();
+    }
+
+    private JsonObject buildChunkedDataRoot() {
+        Map<String, Integer> categoryOrdinals = buildCategoryOrdinals();
+        Map<String, IngredientRefCounts> ingredientCounts = buildIngredientRefCounts();
+
         JsonObject root = new JsonObject();
         root.addProperty("locale", dumpLocale);
         root.addProperty("generatedAt", generatedAt);
+        root.addProperty("outputFormat", exportFormat.getSerializedName());
+        root.addProperty("imagesCaptured", captureImages);
+        root.addProperty("categoryChunkSize", CATEGORY_CHUNK_SIZE);
+        root.addProperty("ingredientBucketHexDigits", INGREDIENT_BUCKET_HEX_DIGITS);
+        root.add("categories", buildCategorySummaries());
+
+        JsonObject categoryOrdinalsRoot = new JsonObject();
+        for (Map.Entry<String, Integer> entry : categoryOrdinals.entrySet()) {
+            categoryOrdinalsRoot.addProperty(entry.getKey(), entry.getValue());
+        }
+        root.add("categoryOrdinals", categoryOrdinalsRoot);
+
+        JsonObject ingredientKindsRoot = new JsonObject();
+        for (IngredientTypeState<?> state : ingredientTypes.values()) {
+            if (state.uniqueCount == 0) continue;
+
+            JsonObject kind = new JsonObject();
+            kind.addProperty("translationKey", state.labelKey);
+            kind.addProperty("className", state.type.getIngredientClass().getName());
+            kind.addProperty("count", state.uniqueCount);
+            ingredientKindsRoot.add(state.kind, kind);
+        }
+        for (Map.Entry<String, VirtualIngredientKindState> entry : virtualIngredientKinds.entrySet()) {
+            VirtualIngredientKindState state = entry.getValue();
+            if (state.uniqueCount == 0) continue;
+
+            JsonObject kind = new JsonObject();
+            kind.addProperty("translationKey", state.translationKey);
+            kind.addProperty("className", state.className);
+            kind.addProperty("count", state.uniqueCount);
+            ingredientKindsRoot.add(entry.getKey(), kind);
+        }
+        root.add("ingredientKinds", ingredientKindsRoot);
+
+        root.add("ingredients", buildIngredientSummaries(ingredientCounts));
+        root.add("ingredientMetaBuckets", buildDeclaredIngredientBuckets(ingredientMeta.keySet()));
+        root.add("ingredientRefBuckets", buildDeclaredIngredientBuckets(ingredientRecipes.keySet()));
+        return root;
+    }
+
+    private JsonObject buildMonolithicDataRoot() {
+        JsonObject root = new JsonObject();
+        root.addProperty("locale", dumpLocale);
+        root.addProperty("generatedAt", generatedAt);
+        root.addProperty("outputFormat", exportFormat.getSerializedName());
+        root.addProperty("imagesCaptured", captureImages);
         root.add("categories", categoriesJson);
 
         JsonObject ingredientKindsRoot = new JsonObject();
@@ -1290,23 +2008,274 @@ public class Dumper {
         root.add("ingredientKinds", ingredientKindsRoot);
 
         JsonObject ingredientsRoot = new JsonObject();
-        for (Map.Entry<String, JsonObject> e : ingredientMeta.entrySet()) {
-            ingredientsRoot.add(e.getKey(), e.getValue());
+        for (Map.Entry<String, JsonObject> entry : ingredientMeta.entrySet()) {
+            ingredientsRoot.add(entry.getKey(), copyJsonObject(entry.getValue()));
         }
         root.add("ingredients", ingredientsRoot);
 
         JsonObject ingredientRecipesRoot = new JsonObject();
-        for (Map.Entry<String, JsonArray> e : ingredientRecipes.entrySet()) {
-            ingredientRecipesRoot.add(e.getKey(), e.getValue());
+        for (Map.Entry<String, JsonArray> entry : ingredientRecipes.entrySet()) {
+            ingredientRecipesRoot.add(entry.getKey(), entry.getValue());
         }
         root.add("ingredientRecipes", ingredientRecipesRoot);
         return root;
+    }
+
+    private JsonArray buildCategorySummaries() {
+        JsonArray summaries = new JsonArray();
+        int ordinal = 0;
+        for (JsonElement categoryElement : categoriesJson) {
+            JsonObject category = categoryElement.getAsJsonObject();
+            JsonObject summary = new JsonObject();
+            int recipeCount = category.has("recipeCount")
+                ? category.get("recipeCount").getAsInt()
+                : categoryRecipeCount(category);
+
+            summary.add("id", category.get("id"));
+            summary.add("uid", category.get("uid"));
+            summary.add("title", category.get("title"));
+            summary.add("modName", category.get("modName"));
+            summary.addProperty("ordinal", ordinal++);
+            summary.addProperty("recipeCount", recipeCount);
+            summary.addProperty("chunkCount", chunkCountForRecipeCount(recipeCount));
+            if (category.has("backgroundImg")) summary.add("backgroundImg", category.get("backgroundImg"));
+
+            summaries.add(summary);
+        }
+
+        return summaries;
+    }
+
+    private Map<String, Integer> buildCategoryOrdinals() {
+        Map<String, Integer> ordinals = new LinkedHashMap<>();
+        int ordinal = 0;
+        for (JsonElement categoryElement : categoriesJson) {
+            JsonObject category = categoryElement.getAsJsonObject();
+            ordinals.put(category.get("id").getAsString(), ordinal++);
+        }
+
+        return ordinals;
+    }
+
+    private Map<String, IngredientRefCounts> buildIngredientRefCounts() {
+        Map<String, IngredientRefCounts> countsByIngredient = new LinkedHashMap<>();
+        for (Map.Entry<String, JsonArray> entry : ingredientRecipes.entrySet()) {
+            IngredientRefCounts counts = new IngredientRefCounts();
+            for (JsonElement refElement : entry.getValue()) {
+                JsonObject ref = refElement.getAsJsonObject();
+                String role = ref.get("role").getAsString();
+                if ("out".equals(role)) {
+                    counts.recipes++;
+                } else if ("in".equals(role)) {
+                    counts.uses++;
+                }
+            }
+
+            countsByIngredient.put(entry.getKey(), counts);
+        }
+
+        return countsByIngredient;
+    }
+
+    private JsonObject buildIngredientSummaries(Map<String, IngredientRefCounts> ingredientCounts) {
+        JsonObject summaries = new JsonObject();
+        for (Map.Entry<String, JsonObject> entry : ingredientMeta.entrySet()) {
+            JsonObject fullMeta = entry.getValue();
+            JsonObject summary = new JsonObject();
+            summary.add("name", fullMeta.get("name"));
+            summary.add("nameHtml", fullMeta.get("nameHtml"));
+            summary.add("mod", fullMeta.get("mod"));
+            if (fullMeta.has("img")) summary.add("img", fullMeta.get("img"));
+            summary.add("kind", fullMeta.get("kind"));
+
+            IngredientRefCounts counts = ingredientCounts.get(entry.getKey());
+            summary.addProperty("recipeCount", counts == null ? 0 : counts.recipes);
+            summary.addProperty("useCount", counts == null ? 0 : counts.uses);
+            summaries.add(entry.getKey(), summary);
+        }
+
+        return summaries;
+    }
+
+    private JsonArray buildDeclaredIngredientBuckets(Set<String> ingredientIds) {
+        Set<String> uniqueBuckets = new LinkedHashSet<>();
+        for (String ingredientId : ingredientIds) {
+            uniqueBuckets.add(ingredientBucketId(ingredientId));
+        }
+
+        List<String> bucketIds = new ArrayList<>(uniqueBuckets);
+        Collections.sort(bucketIds);
+
+        JsonArray buckets = new JsonArray();
+        for (String bucketId : bucketIds) {
+            buckets.add(bucketId);
+        }
+        return buckets;
+    }
+
+    private void writeCategoryChunks() throws IOException {
+        for (JsonElement categoryElement : categoriesJson) {
+            JsonObject category = categoryElement.getAsJsonObject();
+            JsonArray recipes = category.getAsJsonArray("recipes");
+            if (recipes == null || recipes.size() == 0) continue;
+
+            String categoryId = category.get("id").getAsString();
+            File categoryDir = new File(catRoot, categoryId);
+            if (!categoryDir.mkdirs() && !categoryDir.exists()) throw new IOException("Cannot create " + categoryDir);
+
+            int chunkIndex = 0;
+            for (int startIndex = 0; startIndex < recipes.size(); startIndex += CATEGORY_CHUNK_SIZE) {
+                JsonObject chunk = new JsonObject();
+                JsonArray chunkRecipes = new JsonArray();
+                int endIndex = Math.min(recipes.size(), startIndex + CATEGORY_CHUNK_SIZE);
+                for (int recipeIndex = startIndex; recipeIndex < endIndex; recipeIndex++) {
+                    chunkRecipes.add(recipes.get(recipeIndex));
+                }
+
+                chunk.addProperty("id", categoryId);
+                chunk.addProperty("chunkIndex", chunkIndex);
+                chunk.addProperty("start", startIndex);
+                chunk.add("recipes", chunkRecipes);
+
+                writeJson(chunk, new File(categoryDir, "chunk_" + chunkIndex + ".json"));
+                if (writesHtmlShell()) {
+                    writeCategoryChunkScript(chunk, new File(categoryDir, "chunk_" + chunkIndex + ".js"), dumpLocale, categoryId, chunkIndex);
+                }
+
+                chunkIndex++;
+            }
+        }
+    }
+
+    private void writeIngredientMetaBuckets() throws IOException {
+        Map<String, JsonObject> buckets = new LinkedHashMap<>();
+        for (Map.Entry<String, JsonObject> entry : ingredientMeta.entrySet()) {
+            String ingredientId = entry.getKey();
+            String bucketId = ingredientBucketId(ingredientId);
+            JsonObject payload = getOrCreateIngredientBucketPayload(buckets, bucketId);
+            JsonObject ingredientsRoot = payload.getAsJsonObject("ingredients");
+
+            JsonObject fullMeta = copyJsonObject(entry.getValue());
+            fullMeta.addProperty("id", ingredientId);
+            ingredientsRoot.add(ingredientId, fullMeta);
+        }
+
+        writeIngredientBucketFiles(buckets, "meta", INGREDIENT_META_BUCKET_REGISTRY);
+    }
+
+    private void writeIngredientRefBuckets() throws IOException {
+        Map<String, Integer> categoryOrdinals = buildCategoryOrdinals();
+        Map<String, JsonObject> buckets = new LinkedHashMap<>();
+
+        for (Map.Entry<String, JsonArray> entry : ingredientRecipes.entrySet()) {
+            String ingredientId = entry.getKey();
+            String bucketId = ingredientBucketId(ingredientId);
+            JsonObject payload = getOrCreateIngredientBucketPayload(buckets, bucketId);
+            JsonObject ingredientsRoot = payload.getAsJsonObject("ingredients");
+
+            JsonObject ingredientRefs = new JsonObject();
+            ingredientRefs.addProperty("id", ingredientId);
+
+            for (JsonElement refElement : entry.getValue()) {
+                JsonObject ref = refElement.getAsJsonObject();
+                Integer categoryOrdinal = categoryOrdinals.get(ref.get("cat").getAsString());
+                if (categoryOrdinal == null) continue;
+
+                String roleKey = "out".equals(ref.get("role").getAsString()) ? "recipes" : "uses";
+                addGroupedIngredientRef(ingredientRefs, roleKey, categoryOrdinal.intValue(), ref.get("idx").getAsInt());
+            }
+
+            ingredientsRoot.add(ingredientId, ingredientRefs);
+        }
+
+        writeIngredientBucketFiles(buckets, "refs", INGREDIENT_REF_BUCKET_REGISTRY);
+    }
+
+    private JsonObject getOrCreateIngredientBucketPayload(Map<String, JsonObject> buckets, String bucketId) {
+        JsonObject payload = buckets.get(bucketId);
+        if (payload != null) return payload;
+
+        payload = new JsonObject();
+        payload.addProperty("bucket", bucketId);
+        payload.add("ingredients", new JsonObject());
+        buckets.put(bucketId, payload);
+        return payload;
+    }
+
+    private void writeIngredientBucketFiles(Map<String, JsonObject> buckets, String filePrefix, String registryName)
+        throws IOException {
+        for (Map.Entry<String, JsonObject> entry : buckets.entrySet()) {
+            String bucketId = entry.getKey();
+            JsonObject payload = entry.getValue();
+
+            writeJson(payload, new File(resourceRoot, filePrefix + "_" + bucketId + ".json"));
+            if (writesHtmlShell()) {
+                writeLocaleBucketScript(
+                    payload,
+                    new File(resourceRoot, filePrefix + "_" + bucketId + ".js"),
+                    registryName,
+                    dumpLocale,
+                    bucketId
+                );
+            }
+        }
+    }
+
+    private void addGroupedIngredientRef(JsonObject ingredientRefs, String roleKey, int categoryOrdinal, int recipeIndex) {
+        JsonObject roleRoot = ingredientRefs.has(roleKey)
+            ? ingredientRefs.getAsJsonObject(roleKey)
+            : new JsonObject();
+        String categoryKey = Integer.toString(categoryOrdinal);
+        JsonObject categoryRoot = roleRoot.has(categoryKey)
+            ? roleRoot.getAsJsonObject(categoryKey)
+            : new JsonObject();
+        int chunkIndex = recipeIndex / CATEGORY_CHUNK_SIZE;
+        int localIndex = recipeIndex % CATEGORY_CHUNK_SIZE;
+        String chunkKey = Integer.toString(chunkIndex);
+        JsonArray chunkRefs = categoryRoot.has(chunkKey)
+            ? categoryRoot.getAsJsonArray(chunkKey)
+            : new JsonArray();
+
+        chunkRefs.add(localIndex);
+        categoryRoot.add(chunkKey, chunkRefs);
+        roleRoot.add(categoryKey, categoryRoot);
+        ingredientRefs.add(roleKey, roleRoot);
+    }
+
+    private static JsonObject copyJsonObject(JsonObject source) {
+        JsonObject copy = new JsonObject();
+        for (Map.Entry<String, JsonElement> entry : source.entrySet()) {
+            copy.add(entry.getKey(), entry.getValue());
+        }
+
+        return copy;
+    }
+
+    private static int categoryRecipeCount(JsonObject category) {
+        JsonArray recipes = category.getAsJsonArray("recipes");
+        return recipes == null ? 0 : recipes.size();
+    }
+
+    private static int chunkCountForRecipeCount(int recipeCount) {
+        if (recipeCount <= 0) return 0;
+
+        return (recipeCount + CATEGORY_CHUNK_SIZE - 1) / CATEGORY_CHUNK_SIZE;
+    }
+
+    private static String ingredientBucketId(String ingredientId) {
+        int bucket = (ingredientId.hashCode() & Integer.MAX_VALUE) % INGREDIENT_BUCKET_COUNT;
+        String hex = Integer.toHexString(bucket);
+        while (hex.length() < INGREDIENT_BUCKET_HEX_DIGITS) {
+            hex = "0" + hex;
+        }
+        return hex;
     }
 
     private boolean prepareBackgroundSplitTasks() {
         backgroundSplitTasks.clear();
         backgroundSplitTaskIdx = 0;
         dedupSavedBytes = 0L;
+        dedupSafetySkippedCategories = 0;
         if (!splitRecipeBackgrounds) return false;
 
         for (JsonElement categoryElement : categoriesJson) {
@@ -1352,6 +2321,8 @@ public class Dumper {
                 if (task.session.wasApplied()) {
                     task.category.addProperty("backgroundImg", task.backgroundImgPath);
                     dedupSavedBytes += task.session.getSavedBytes();
+                } else if (task.session.wasSkippedForSafety()) {
+                    dedupSafetySkippedCategories++;
                 }
             } catch (IOException e) {
                 String categoryId = task.category.get("id").getAsString();
@@ -1368,13 +2339,17 @@ public class Dumper {
     private void writeDataManifest() throws IOException {
         JsonObject manifest = new JsonObject();
         manifest.addProperty("latestDumpLocale", dumpLocale);
+        manifest.addProperty("outputFormat", exportFormat.getSerializedName());
+        manifest.addProperty("imagesCaptured", captureImages);
 
         JsonArray availableDataLocales = new JsonArray();
         for (String locale : listAvailableDataLocales()) availableDataLocales.add(locale);
         manifest.add("availableDataLocales", availableDataLocales);
 
         writeJson(manifest, new File(dataDir, "manifest.json"));
-        writeGlobalScript(manifest, new File(dataDir, "manifest.js"), "window.__JEI_DUMP_MANIFEST = ");
+        if (writesHtmlShell()) {
+            writeGlobalScript(manifest, new File(dataDir, "manifest.js"), "window.__JEI_DUMP_MANIFEST = ");
+        }
     }
 
     /** Copy the bundled lang files and emit a JS-friendly translation table for the website. */
@@ -1429,15 +2404,21 @@ public class Dumper {
         return "data/locales/" + dumpLocale + "/" + relativePath;
     }
 
-    private void writeJson(JsonObject root, File dst) throws IOException {
+    private void writeJson(JsonElement root, File dst) throws IOException {
         try (BufferedWriter bw = Files.newBufferedWriter(dst.toPath(), StandardCharsets.UTF_8)) {
             gson.toJson(root, bw);
         }
     }
 
-    private void writeLocaleDataScript(JsonObject root, File dst, String locale) throws IOException {
+    private void writeLocaleDataScript(JsonElement root, File dst, String locale) throws IOException {
         try (BufferedWriter bw = Files.newBufferedWriter(dst.toPath(), StandardCharsets.UTF_8)) {
-            bw.write("window.__JEI_DUMP_DATASETS = window.__JEI_DUMP_DATASETS || {};\nwindow.__JEI_DUMP_DATASETS[");
+            bw.write("window.");
+            bw.write(DATASET_REGISTRY);
+            bw.write(" = window.");
+            bw.write(DATASET_REGISTRY);
+            bw.write(" || {};\nwindow.");
+            bw.write(DATASET_REGISTRY);
+            bw.write("[");
             gson.toJson(locale, bw);
             bw.write("] = ");
             gson.toJson(root, bw);
@@ -1445,7 +2426,75 @@ public class Dumper {
         }
     }
 
-    private void writeGlobalScript(JsonObject root, File dst, String prefix) throws IOException {
+    private void writeCategoryChunkScript(JsonElement chunk, File dst, String locale, String categoryId, int chunkIndex)
+        throws IOException {
+        try (BufferedWriter bw = Files.newBufferedWriter(dst.toPath(), StandardCharsets.UTF_8)) {
+            bw.write("window.");
+            bw.write(CATEGORY_CHUNK_REGISTRY);
+            bw.write(" = window.");
+            bw.write(CATEGORY_CHUNK_REGISTRY);
+            bw.write(" || {};\nwindow.");
+            bw.write(CATEGORY_CHUNK_REGISTRY);
+            bw.write("[");
+            gson.toJson(locale, bw);
+            bw.write("] = window.");
+            bw.write(CATEGORY_CHUNK_REGISTRY);
+            bw.write("[");
+            gson.toJson(locale, bw);
+            bw.write("] || {};\nwindow.");
+            bw.write(CATEGORY_CHUNK_REGISTRY);
+            bw.write("[");
+            gson.toJson(locale, bw);
+            bw.write("][");
+            gson.toJson(categoryId, bw);
+            bw.write("] = window.");
+            bw.write(CATEGORY_CHUNK_REGISTRY);
+            bw.write("[");
+            gson.toJson(locale, bw);
+            bw.write("][");
+            gson.toJson(categoryId, bw);
+            bw.write("] || {};\nwindow.");
+            bw.write(CATEGORY_CHUNK_REGISTRY);
+            bw.write("[");
+            gson.toJson(locale, bw);
+            bw.write("][");
+            gson.toJson(categoryId, bw);
+            bw.write("][");
+            gson.toJson(chunkIndex, bw);
+            bw.write("] = ");
+            gson.toJson(chunk, bw);
+            bw.write(";\n");
+        }
+    }
+
+    private void writeLocaleBucketScript(JsonElement payload, File dst, String registryName, String locale, String bucketId)
+        throws IOException {
+        try (BufferedWriter bw = Files.newBufferedWriter(dst.toPath(), StandardCharsets.UTF_8)) {
+            bw.write("window.");
+            bw.write(registryName);
+            bw.write(" = window.");
+            bw.write(registryName);
+            bw.write(" || {};\nwindow.");
+            bw.write(registryName);
+            bw.write("[");
+            gson.toJson(locale, bw);
+            bw.write("] = window.");
+            bw.write(registryName);
+            bw.write("[");
+            gson.toJson(locale, bw);
+            bw.write("] || {};\nwindow.");
+            bw.write(registryName);
+            bw.write("[");
+            gson.toJson(locale, bw);
+            bw.write("][");
+            gson.toJson(bucketId, bw);
+            bw.write("] = ");
+            gson.toJson(payload, bw);
+            bw.write(";\n");
+        }
+    }
+
+    private void writeGlobalScript(JsonElement root, File dst, String prefix) throws IOException {
         try (BufferedWriter bw = Files.newBufferedWriter(dst.toPath(), StandardCharsets.UTF_8)) {
             bw.write(prefix);
             gson.toJson(root, bw);
@@ -1459,6 +2508,10 @@ public class Dumper {
             if (meta.has("img")) count++;
         }
         return count;
+    }
+
+    private boolean writesHtmlShell() {
+        return exportFormat == JeiDumpConfig.ExportFormat.HTML;
     }
 
     private static String formatMiB(long bytes) {

@@ -111,7 +111,10 @@ public class IconRenderer {
         private Phase phase = Phase.INIT;
         private long originalBytes;
         private long splitBytes;
+        private long dedupBufferLimitBytes;
+        private long bufferedBytes;
         private boolean applied;
+        private boolean skippedForSafety;
 
         private int width;
         private int height;
@@ -139,6 +142,14 @@ public class IconRenderer {
                             return new DeduplicationStepResult(true, false);
                         }
 
+                        // We only start a category with up to half of the currently available heap so the rest
+                        // of the dump still has room to breathe after the explicit GC pass.
+                        dedupBufferLimitBytes = snapshotDedupBufferLimitBytes();
+                        if (dedupBufferLimitBytes <= 0L) {
+                            skippedForSafety = true;
+                            return finish(false, false);
+                        }
+
                         BufferedImage first = readPng(recipeFiles.get(0));
                         if (first == null) {
                             phase = Phase.DONE;
@@ -150,6 +161,7 @@ public class IconRenderer {
                         sharedPixels = first.getRGB(0, 0, width, height, null, 0, width);
                         sharedMask = new boolean[sharedPixels.length];
                         Arrays.fill(sharedMask, true);
+
                         compareIndex = 1;
                         phase = Phase.COMPARE;
                         return new DeduplicationStepResult(false, true);
@@ -195,20 +207,25 @@ public class IconRenderer {
                         BufferedImage background = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
                         background.setRGB(0, 0, width, height, backgroundPixels, 0, width);
                         backgroundBytes = pngBytes(background);
+                        // The foreground phase only needs the mask, so drop the shared pixel copy
+                        // before the buffered PNG accumulation phase starts.
+                        sharedPixels = null;
                         splitBytes = backgroundBytes.length;
+                        bufferedBytes = backgroundBytes.length;
+                        if (bufferedBytes > dedupBufferLimitBytes) {
+                            skippedForSafety = true;
+                            return finish(false, true);
+                        }
+
                         foregroundBytes = new ArrayList<>(recipeFiles.size());
+
                         encodeIndex = 0;
                         phase = Phase.ENCODE_FOREGROUNDS;
                         return new DeduplicationStepResult(false, true);
 
                     case ENCODE_FOREGROUNDS:
                         if (encodeIndex >= recipeFiles.size()) {
-                            if (splitBytes >= originalBytes) {
-                                backgroundBytes = null;
-                                foregroundBytes = null;
-                                phase = Phase.DONE;
-                                return new DeduplicationStepResult(true, false);
-                            }
+                            if (splitBytes >= originalBytes) return finish(false, false);
 
                             phase = Phase.APPLY_BACKGROUND;
                             continue;
@@ -216,10 +233,7 @@ public class IconRenderer {
 
                         BufferedImage encodedImage = readPng(recipeFiles.get(encodeIndex));
                         if (encodedImage == null || encodedImage.getWidth() != width || encodedImage.getHeight() != height) {
-                            backgroundBytes = null;
-                            foregroundBytes = null;
-                            phase = Phase.DONE;
-                            return new DeduplicationStepResult(true, false);
+                            return finish(false, false);
                         }
 
                         int[] encodedPixels = encodedImage.getRGB(0, 0, width, height, null, 0, width);
@@ -231,16 +245,17 @@ public class IconRenderer {
                         foreground.setRGB(0, 0, width, height, encodedPixels, 0, width);
 
                         byte[] encoded = pngBytes(foreground);
-                        splitBytes += encoded.length;
                         foregroundBytes.add(encoded);
+                        splitBytes += encoded.length;
+                        bufferedBytes += encoded.length;
                         encodeIndex++;
 
-                        if (splitBytes >= originalBytes) {
-                            backgroundBytes = null;
-                            foregroundBytes = null;
-                            phase = Phase.DONE;
-                            return new DeduplicationStepResult(true, true);
+                        if (bufferedBytes > dedupBufferLimitBytes) {
+                            skippedForSafety = true;
+                            return finish(false, true);
                         }
+
+                        if (splitBytes >= originalBytes) return finish(false, true);
 
                         return new DeduplicationStepResult(false, true);
 
@@ -252,22 +267,12 @@ public class IconRenderer {
                         return new DeduplicationStepResult(false, true);
 
                     case APPLY_FOREGROUNDS:
-                        if (applyIndex >= recipeFiles.size()) {
-                            applied = true;
-                            backgroundBytes = null;
-                            foregroundBytes = null;
-                            phase = Phase.DONE;
-                            return new DeduplicationStepResult(true, false);
-                        }
+                        if (applyIndex >= recipeFiles.size()) return finish(true, false);
 
                         Files.write(recipeFiles.get(applyIndex).toPath(), foregroundBytes.get(applyIndex));
                         applyIndex++;
                         if (applyIndex >= recipeFiles.size()) {
-                            applied = true;
-                            backgroundBytes = null;
-                            foregroundBytes = null;
-                            phase = Phase.DONE;
-                            return new DeduplicationStepResult(true, true);
+                            return finish(true, true);
                         }
 
                         return new DeduplicationStepResult(false, true);
@@ -293,8 +298,33 @@ public class IconRenderer {
             return applied;
         }
 
+        public boolean wasSkippedForSafety() {
+            return skippedForSafety;
+        }
+
         public long getSavedBytes() {
             return applied ? Math.max(0L, originalBytes - splitBytes) : 0L;
+        }
+
+        private DeduplicationStepResult finish(boolean applied, boolean consumedImage) throws IOException {
+            this.applied = applied;
+            backgroundBytes = null;
+            foregroundBytes = null;
+            sharedPixels = null;
+            sharedMask = null;
+            bufferedBytes = 0L;
+            phase = Phase.DONE;
+
+            return new DeduplicationStepResult(true, consumedImage);
+        }
+
+        private static long snapshotDedupBufferLimitBytes() {
+            // TODO: should we skip GC for small categories?
+            System.gc();
+            Runtime runtime = Runtime.getRuntime();
+            long usedBytes = runtime.totalMemory() - runtime.freeMemory();
+            long availableBytes = Math.max(0L, runtime.maxMemory() - usedBytes);
+            return availableBytes / 2L;
         }
     }
 
