@@ -41,6 +41,7 @@ import net.minecraft.command.ICommandSender;
 import net.minecraft.init.Items;
 import net.minecraft.item.ItemStack;
 import net.minecraft.util.text.TextFormatting;
+import net.minecraftforge.oredict.OreDictionary;
 
 import mezz.jei.api.IJeiRuntime;
 import mezz.jei.api.IRecipeRegistry;
@@ -102,8 +103,10 @@ import com.jeidump.i18n.JeiDumpLocales;
  *       {@code {x,y,w,h,index}} where {@code index} points at {@code inputs}/{@code outputs}
  *       with keys such as {@code in0} or {@code out2}; synthetic recipe details such as Botania
  *       mana costs still use explicit {@code id}/{@code kind}/{@code role}. Slots may also carry
- *       {@code tooltip}/{@code tooltipHtml} overrides when the live JEI tooltip for that stack
- *       differs from the shared ingredient metadata, for example fluids with different amounts.
+ *       {@code oreDict} when an item-slot alternative set exactly matches an ore-dictionary
+ *       entry and {@code tooltip}/{@code tooltipHtml} overrides when the live JEI tooltip for
+ *       that stack differs from the shared ingredient metadata, for example fluids with
+ *       different amounts.
  *       In compact JSON mode, layout coordinates are omitted and ingredient-backed slots that add
  *       no extra tooltip data are dropped entirely.</li>
  * </ul>
@@ -123,6 +126,8 @@ import com.jeidump.i18n.JeiDumpLocales;
  *       Minecraft {@code §} formatting codes and omit {@code tooltipHtml}.</li>
  *   <li>{@code tooltipHtml}: array of tooltip lines with Minecraft formatting codes converted to
  *       HTML spans for the frontend. Only written for HTML exports.</li>
+ *   <li>{@code oreDicts}: canonical ore-dictionary ids for item ingredients that participate in
+ *       one or more dictionary entries.</li>
  *   <li>{@code kind}: ingredient type key, so the frontend can label arbitrary JEI ingredient
  *       kinds without hardcoding item/fluid buckets. Synthetic recipe details can omit
  *       {@code img} when they do not have a standalone icon.</li>
@@ -132,6 +137,8 @@ import com.jeidump.i18n.JeiDumpLocales;
  * <ul>
  *   <li>{@code generatedAt}: ISO-8601 timestamp captured once when the dump starts, used by the
  *       website footer.</li>
+ *   <li>{@code oreDicts}: used ore-dictionary definitions keyed by canonical
+ *       {@code oredict:<name>} ids.</li>
  *   <li>When chunking is enabled, {@code categories} becomes summary-only and recipe payloads
  *       move into per-category chunk files that the frontend loads on demand.</li>
  *   <li>When chunking is enabled, {@code ingredients} becomes compact search metadata only and
@@ -197,6 +204,19 @@ public class Dumper {
         private VirtualIngredientKindState(String translationKey, String className) {
             this.translationKey = translationKey;
             this.className = className;
+        }
+    }
+
+    /** Synthetic ore-dictionary definition metadata keyed by {@code oredict:<name>}. */
+    private static class OreDictDefinitionState {
+        private final String name;
+        private final String kind;
+        private final JsonArray members = new JsonArray();
+        private final Set<String> memberIds = new LinkedHashSet<>();
+
+        private OreDictDefinitionState(String name, String kind) {
+            this.name = name;
+            this.kind = kind;
         }
     }
 
@@ -489,6 +509,13 @@ public class Dumper {
     private final Map<IIngredientType<?>, IngredientTypeState<?>> ingredientTypes = new LinkedHashMap<>();
     /** Synthetic ingredient kinds for recipe details that JEI draws outside ingredient groups. */
     private final Map<String, VirtualIngredientKindState> virtualIngredientKinds = new LinkedHashMap<>();
+    /** Synthetic ore-dictionary definitions keyed by {@code oredict:<name>}. */
+    private final Map<String, OreDictDefinitionState> oreDictDefinitions = new LinkedHashMap<>();
+    /** Canonical item ore-dictionary name keyed by normalized alias name. */
+    private final Map<String, String> itemOreDictCanonicalNames = new LinkedHashMap<>();
+    /** Canonical item ore-dictionary name keyed by the full expanded member-id set. */
+    private final Map<String, String> itemOreDictCanonicalNamesByMembers = new LinkedHashMap<>();
+    private boolean itemOreDictsIndexed;
 
     // Cached reflective handle to mezz.jei.gui.ingredients.GuiIngredient#getRect().
     // The interface IGuiIngredient does not expose slot positions, but JEI's only concrete
@@ -768,7 +795,6 @@ public class Dumper {
         finalizeCurrentCategory();
     }
 
-    @SuppressWarnings({"rawtypes", "unchecked"})
     private List<RecipeWorkItem> buildRecipeWorkItems(IRecipeCategory<?> category, List<IRecipeWrapper> wrappers) {
         List<RecipeWorkItem> workItems = new ArrayList<>();
         boolean anvilCategory = VanillaRecipeCategoryUid.ANVIL.equals(category.getUid());
@@ -1200,16 +1226,24 @@ public class Dumper {
             recipeRecord.mergeSlotKeys.add(buildRecipeMergeSlotKey(state, ingredient, primary));
             JsonArray recipeIngredients = ingredient.isInput() ? inputs : outputs;
             recipeIngredients.add(new JsonPrimitive(primaryId));
-            addSlot(slots, ingredient, buildSlotIndex(ingredient.isInput(), recipeIngredients.size() - 1), RECIPE_PADDING,
-                buildSlotTooltipOverride(primaryId, buildIngredientTooltip(state, ingredient, primary)));
 
+            List<T> expandedIngredients = expandIngredients(state, ingredient.getAllIngredients());
             Set<String> indexedIds = new LinkedHashSet<>();
             indexedIds.add(primaryId);
-            for (T value : expandIngredients(state, ingredient.getAllIngredients())) {
+            for (T value : expandedIngredients) {
                 if (!isRenderableIngredient(state, value)) continue;
 
                 indexedIds.add(registerIngredient(state, value, ingredient));
             }
+
+            addSlot(
+                slots,
+                ingredient,
+                buildSlotIndex(ingredient.isInput(), recipeIngredients.size() - 1),
+                RECIPE_PADDING,
+                findSlotOreDictId(state, expandedIngredients, indexedIds),
+                buildSlotTooltipOverride(primaryId, buildIngredientTooltip(state, ingredient, primary))
+            );
 
             String role = ingredient.isInput() ? "in" : "out";
             for (String id : indexedIds) {
@@ -1265,6 +1299,11 @@ public class Dumper {
         );
         ingredientTypes.put(type, created);
         return created;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static IngredientTypeState<ItemStack> itemStackState(IngredientTypeState<?> state) {
+        return (IngredientTypeState<ItemStack>) state;
     }
 
     @Nullable
@@ -1336,6 +1375,12 @@ public class Dumper {
         }
         meta.addProperty("kind", state.kind);
         addSerializedTooltip(meta, tooltip);
+
+        if (state.type == VanillaTypes.ITEM && ingredient instanceof ItemStack) {
+            List<String> oreDictIds = registerIngredientOreDicts(itemStackState(state), (ItemStack) ingredient, id);
+            if (!oreDictIds.isEmpty()) meta.add("oreDicts", toJsonArray(oreDictIds));
+        }
+
         ingredientMeta.put(id, meta);
         state.uniqueCount++;
         return id;
@@ -1364,6 +1409,178 @@ public class Dumper {
         } catch (Throwable t) {
             return "unknown";
         }
+    }
+
+    private List<String> registerIngredientOreDicts(IngredientTypeState<ItemStack> state, ItemStack ingredient,
+                                                    String memberId) {
+        List<String> oreDictIds = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
+
+        for (String oreName : readItemStackOreDictNames(ingredient)) {
+            String oreDictId = registerOreDictDefinition(canonicalItemOreDictName(state, oreName), state.kind, memberId);
+            if (!seen.add(oreDictId)) continue;
+
+            oreDictIds.add(oreDictId);
+        }
+
+        return oreDictIds;
+    }
+
+    /**
+     * Return the ore-dictionary id for this slot when the expanded ingredient set exactly matches
+     * a registered ore entry, or {@code null} when it does not.
+     */
+    @Nullable
+    private <T> String findSlotOreDictId(IngredientTypeState<T> state, List<T> expandedIngredients,
+                                         Set<String> ingredientIds) {
+        if (state.type != VanillaTypes.ITEM) return null;
+        if (expandedIngredients.size() < 2 || ingredientIds.size() < 2) return null;
+
+        return findItemStackOreDictId(itemStackState(state), ingredientIds);
+    }
+
+    @Nullable
+    private String findItemStackOreDictId(IngredientTypeState<ItemStack> state, Set<String> ingredientIds) {
+        indexItemOreDicts(state);
+
+        String oreName = itemOreDictCanonicalNamesByMembers.get(ingredientIdSignature(ingredientIds));
+        if (oreName == null) return null;
+
+        String oreDictId = registerOreDictDefinition(oreName, state.kind, null);
+        for (String memberId : ingredientIds) {
+            registerOreDictDefinition(oreName, state.kind, memberId);
+        }
+
+        return oreDictId;
+    }
+
+    private String canonicalItemOreDictName(IngredientTypeState<ItemStack> state, String oreName) {
+        indexItemOreDicts(state);
+
+        String canonicalName = itemOreDictCanonicalNames.get(normalizeOreDictName(oreName));
+        return canonicalName == null ? oreName.trim() : canonicalName;
+    }
+
+    /**
+     * Index item ore entries once so slot detection can compare exact member sets instead of
+     * guessing from whichever ingredient JEI exposes first.
+     */
+    private void indexItemOreDicts(IngredientTypeState<ItemStack> state) {
+        if (itemOreDictsIndexed) return;
+
+        itemOreDictsIndexed = true;
+        Map<String, List<String>> oreNamesByMembers = new LinkedHashMap<>();
+        for (String oreName : OreDictionary.getOreNames()) {
+            if (oreName == null) continue;
+
+            String trimmed = oreName.trim();
+            if (trimmed.isEmpty()) continue;
+
+            List<ItemStack> oreIngredients = expandIngredients(state, new ArrayList<>(OreDictionary.getOres(trimmed)));
+            Set<String> oreIngredientIds = ingredientIdsFor(state, oreIngredients);
+            if (oreIngredientIds.isEmpty()) continue;
+
+            String signature = ingredientIdSignature(oreIngredientIds);
+            List<String> aliases = oreNamesByMembers.get(signature);
+            if (aliases == null) {
+                aliases = new ArrayList<>();
+                oreNamesByMembers.put(signature, aliases);
+            }
+            if (!aliases.contains(trimmed)) aliases.add(trimmed);
+        }
+
+        for (Map.Entry<String, List<String>> entry : oreNamesByMembers.entrySet()) {
+            String canonicalName = pickCanonicalOreDictName(entry.getValue());
+            if (canonicalName == null) continue;
+
+            itemOreDictCanonicalNamesByMembers.put(entry.getKey(), canonicalName);
+            for (String oreName : entry.getValue()) {
+                itemOreDictCanonicalNames.put(normalizeOreDictName(oreName), canonicalName);
+            }
+        }
+    }
+
+    @Nullable
+    private static String pickCanonicalOreDictName(Collection<String> oreNames) {
+        String canonicalName = null;
+        String canonicalNormalized = null;
+        for (String oreName : oreNames) {
+            String trimmed = oreName.trim();
+            if (trimmed.isEmpty()) continue;
+
+            String normalized = normalizeOreDictName(trimmed);
+            if (canonicalName == null
+                || normalized.compareTo(canonicalNormalized) < 0
+                || (normalized.equals(canonicalNormalized) && trimmed.compareTo(canonicalName) < 0)) {
+                canonicalName = trimmed;
+                canonicalNormalized = normalized;
+            }
+        }
+
+        return canonicalName;
+    }
+
+    private String registerOreDictDefinition(String oreName, String kind, @Nullable String memberId) {
+        String normalizedName = normalizeOreDictName(oreName);
+        String oreDictId = "oredict:" + normalizedName;
+
+        OreDictDefinitionState definition = oreDictDefinitions.get(oreDictId);
+        if (definition == null) {
+            definition = new OreDictDefinitionState(oreName.trim(), kind);
+            oreDictDefinitions.put(oreDictId, definition);
+        }
+
+        if (memberId != null && definition.memberIds.add(memberId)) {
+            definition.members.add(new JsonPrimitive(memberId));
+        }
+
+        return oreDictId;
+    }
+
+    private static List<String> readItemStackOreDictNames(ItemStack ingredient) {
+        List<String> names = new ArrayList<>();
+        if (ingredient.isEmpty()) return names;
+
+        Set<String> seen = new LinkedHashSet<>();
+        for (int oreId : OreDictionary.getOreIDs(ingredient)) {
+            String oreName = OreDictionary.getOreName(oreId);
+            if (oreName == null) continue;
+
+            String trimmed = oreName.trim();
+            if (trimmed.isEmpty() || !seen.add(trimmed)) continue;
+
+            names.add(trimmed);
+        }
+
+        return names;
+    }
+
+    private static String normalizeOreDictName(String oreName) {
+        return oreName.trim().toLowerCase(Locale.ROOT);
+    }
+
+    private static <T> Set<String> ingredientIdsFor(IngredientTypeState<T> state, Collection<T> ingredients) {
+        Set<String> ids = new LinkedHashSet<>();
+        for (T ingredient : ingredients) {
+            if (!isRenderableIngredient(state, ingredient)) continue;
+
+            ids.add(state.kind + ":" + safeUniqueId(state, ingredient));
+        }
+
+        return ids;
+    }
+
+    private static String ingredientIdSignature(Collection<String> ingredientIds) {
+        List<String> sortedIds = new ArrayList<>(ingredientIds);
+        Collections.sort(sortedIds);
+        return String.join("\n", sortedIds);
+    }
+
+    private static JsonArray toJsonArray(Collection<String> values) {
+        JsonArray json = new JsonArray();
+        for (String value : values) json.add(new JsonPrimitive(value));
+
+        return json;
     }
 
     @Nullable
@@ -1761,7 +1978,7 @@ public class Dumper {
      * ingredient ids.
      */
     private void addSlot(JsonArray slots, IGuiIngredient<?> ig, String index, int padding,
-                         @Nullable TooltipText tooltipOverride) {
+                         @Nullable String oreDictId, @Nullable TooltipText tooltipOverride) {
         Rectangle r = readRect(ig);
         if (!compactJsonSlots && r == null) return;
 
@@ -1773,6 +1990,7 @@ public class Dumper {
             slot.addProperty("h", r.height);
         }
         slot.addProperty("index", index);
+        if (oreDictId != null) slot.addProperty("oreDict", oreDictId);
         if (tooltipOverride != null) addSerializedTooltip(slot, tooltipOverride);
 
         if (compactJsonSlots && isRedundantIndexedSlot(slot)) return;
@@ -1971,6 +2189,8 @@ public class Dumper {
         }
         root.add("ingredientKinds", ingredientKindsRoot);
 
+        root.add("oreDicts", buildOreDictDefinitionsRoot());
+
         root.add("ingredients", buildIngredientSummaries(ingredientCounts));
         root.add("ingredientMetaBuckets", buildDeclaredIngredientBuckets(ingredientMeta.keySet()));
         root.add("ingredientRefBuckets", buildDeclaredIngredientBuckets(ingredientRecipes.keySet()));
@@ -2006,6 +2226,8 @@ public class Dumper {
             ingredientKindsRoot.add(entry.getKey(), kind);
         }
         root.add("ingredientKinds", ingredientKindsRoot);
+
+        root.add("oreDicts", buildOreDictDefinitionsRoot());
 
         JsonObject ingredientsRoot = new JsonObject();
         for (Map.Entry<String, JsonObject> entry : ingredientMeta.entrySet()) {
@@ -2095,6 +2317,21 @@ public class Dumper {
         }
 
         return summaries;
+    }
+
+    private JsonObject buildOreDictDefinitionsRoot() {
+        JsonObject root = new JsonObject();
+        for (Map.Entry<String, OreDictDefinitionState> entry : oreDictDefinitions.entrySet()) {
+            OreDictDefinitionState definition = entry.getValue();
+            JsonObject oreDict = new JsonObject();
+            oreDict.addProperty("name", definition.name);
+            oreDict.addProperty("kind", definition.kind);
+            oreDict.addProperty("count", definition.memberIds.size());
+            oreDict.add("members", definition.members);
+            root.add(entry.getKey(), oreDict);
+        }
+
+        return root;
     }
 
     private JsonArray buildDeclaredIngredientBuckets(Set<String> ingredientIds) {

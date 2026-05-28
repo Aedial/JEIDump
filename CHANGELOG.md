@@ -8,6 +8,11 @@ The format is based on Keep a Changelog and this project adheres to Semantic Ver
 - Semantic Versioning: https://semver.org/spec/v2.0.0.html
 
 
+## [1.3.1] - 2025-05-27
+### Added
+- Export ore-dictionary memberships in ingredient metadata and emit explicit ore-dictionary references for recipe slots with oredict definition, for the JSON output (website may follow in a future update).
+
+
 ## [1.3.0] - 2025-05-08
 ### Added
 - Merge exported anvil recipe cards when their visible slots only differ by item damage, which trims duplicate repair entries while keeping all exact ingredient pages linked to the surviving card.
